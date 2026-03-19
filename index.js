@@ -10,7 +10,6 @@ let accountStats = {};
 let config = {
     betAmount: 5,
     minBalanceToBet: 10,
-    maxCycles: 0,
 };
 
 function autoDelay(baseMs) {
@@ -290,7 +289,7 @@ async function runAccount(idx) {
     console.log(`[Acc#${idx + 1}] 💰 Balance: ${balance} ${userData.points?.symbol || 'PTS'}`);
     let cycleCount = 0;
     let consecutiveNoEvents = 0;
-    const MAX_CONSECUTIVE = 5;
+    const MAX_CONSECUTIVE = 2;
     while (true) {
         if (!queries[idx]) { console.log(`[Acc#${idx + 1}] ❌ Query removed, stopping.`); break; }
         try {
@@ -314,9 +313,8 @@ async function runAccount(idx) {
                 consecutiveNoEvents++;
                 console.log(`[Acc#${idx + 1}] ⏳ No new events (${consecutiveNoEvents}/${MAX_CONSECUTIVE})`);
                 if (consecutiveNoEvents >= MAX_CONSECUTIVE) {
-                    console.log(`[Acc#${idx + 1}] ⏳ Waiting 15 min...`);
-                    await new Promise(r => setTimeout(r, autoDelay(900000)));
-                    consecutiveNoEvents = 0;
+                    console.log(`[Acc#${idx + 1}] 🏁 Bet limit reached or no events left. Done for today.`);
+                    break;
                 } else {
                     await new Promise(r => setTimeout(r, autoDelay(30000)));
                 }
@@ -363,14 +361,14 @@ async function runAccount(idx) {
                 console.log(`\n[Acc#${idx + 1}] ✅ Placed ${betsPlaced} bets | Active: ${Object.keys(loadActiveBets(idx)).length}`);
             }
             showStats(idx, userName);
-            if (config.maxCycles > 0 && cycleCount >= config.maxCycles) {
-                console.log(`[Acc#${idx + 1}] 🏁 Reached ${config.maxCycles} cycles, stopping.`);
-                break;
-            }
             const breakMs = autoDelay(15000);
             console.log(`[Acc#${idx + 1}] 😴 Break: ${(breakMs / 1000).toFixed(1)}s`);
             await new Promise(r => setTimeout(r, breakMs));
         } catch (error) {
+            if (error.message && error.message.includes("Cannot read properties of null")) {
+                console.log(`[Acc#${idx + 1}] 🏁 Bet limit reached. Done for today.`);
+                break;
+            }
             console.error(`[Acc#${idx + 1}] ❌ Cycle error: ${error.message}`);
             await new Promise(r => setTimeout(r, autoDelay(30000)));
         }
@@ -382,13 +380,10 @@ async function setup() {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     const ask = q => new Promise(resolve => rl.question(q, a => resolve(a.trim())));
     const betAmountRaw = await ask('💰 Bet amount per event (default: 5): ');
-    const maxCyclesRaw = await ask('🔄 Max cycles per account (0 = unlimited, default: 0): ');
     rl.close();
     config.betAmount = parseInt(betAmountRaw) || 5;
-    config.maxCycles = parseInt(maxCyclesRaw) || 0;
     console.log('\n✅ Configuration:');
     console.log(`   Bet Amount:  ${config.betAmount} PTS`);
-    console.log(`   Max Cycles:  ${config.maxCycles === 0 ? 'Unlimited' : config.maxCycles}\n`);
 }
 
 async function main() {
