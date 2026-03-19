@@ -1,0 +1,14 @@
+{
+  "name": "yeno-bot",
+  "version": "2.0.0",
+  "description": "Automated multi-account bot for Yeno Telegram prediction game",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "mejri02",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.2"
+  }
+}
