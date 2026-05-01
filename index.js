@@ -1,15 +1,31 @@
 const axios = require('axios');
 const fs = require('fs');
 const readline = require('readline');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const crypto = require('crypto');
 
 const API_BASE = 'https://api.yeno.pro/tma/v1';
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
 let queries = [];
 let accountStats = {};
+let proxyList = [];
+let currentProxyIndex = {};
+let proxyFailCount = {};
+let activeProxies = [];
+let groqApiKey = null;
+let useGroq = false;
 
 let config = {
     betAmount: 5,
     minBalanceToBet: 10,
+    useProxies: false,
+    rotateProxyOnError: true,
+    maxRetriesPerRequest: 2,
+    requestDelay: { min: 2000, max: 8000 },
+    maxProxyFails: 3,
 };
 
 const C = {
@@ -24,22 +40,272 @@ const C = {
     bWhite:  '\x1b[97m',
 };
 
-function clr(color, text) { return `${C[color] || ''}${text}${C.reset}`; }
-function bold(text)        { return `${C.bold}${text}${C.reset}`; }
+function clr(color, text) {
+    if (!C[color]) return text;
+    return `${C[color]}${text}${C.reset}`;
+}
 
-function autoDelay(baseMs) {
+function bold(text) { return `${C.bold}${text}${C.reset}`; }
+
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+];
+
+const WEBGL_RENDERERS = [
+    'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)',
+    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)',
+    'ANGLE (AMD, Radeon RX 580 Direct3D11 vs_5_0 ps_5_0)',
+];
+
+const WEBGL_VENDORS = ['Google Inc. (Intel)', 'NVIDIA Corporation', 'Advanced Micro Devices, Inc.'];
+const PLATFORMS = ['Win32', 'MacIntel', 'Linux x86_64', 'iPhone', 'iPad', 'Android'];
+const CPU_CLASSES = ['x86', 'x86_64', 'ARM', 'ARM64'];
+const LANGUAGES = [['en-US', 'en'], ['en-GB', 'en'], ['zh-CN', 'zh', 'en-US', 'en']];
+const TIMEZONES = [-420, -300, -240, -180, 0, 60, 120, 180, 240, 330, 480, 570];
+const SCREEN_RESOLUTIONS = [
+    { width: 1920, height: 1080 }, { width: 1366, height: 768 },
+    { width: 1536, height: 864 }, { width: 1440, height: 900 },
+];
+
+function getRandomUserAgent() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
+function getRandomWebGLRenderer() { return WEBGL_RENDERERS[Math.floor(Math.random() * WEBGL_RENDERERS.length)]; }
+function getRandomWebGLVendor() { return WEBGL_VENDORS[Math.floor(Math.random() * WEBGL_VENDORS.length)]; }
+function getRandomPlatform() { return PLATFORMS[Math.floor(Math.random() * PLATFORMS.length)]; }
+function getRandomCPUClass() { return CPU_CLASSES[Math.floor(Math.random() * CPU_CLASSES.length)]; }
+function getRandomLanguages() { return LANGUAGES[Math.floor(Math.random() * LANGUAGES.length)]; }
+function getRandomTimezone() { return TIMEZONES[Math.floor(Math.random() * TIMEZONES.length)]; }
+function getRandomScreenResolution() { return SCREEN_RESOLUTIONS[Math.floor(Math.random() * SCREEN_RESOLUTIONS.length)]; }
+function generateRandomColorDepth() { const depths = [24, 30, 32]; return depths[Math.floor(Math.random() * depths.length)]; }
+function generateRandomDeviceMemory() { const memories = [2, 4, 8, 16]; return memories[Math.floor(Math.random() * memories.length)]; }
+function generateRandomHardwareConcurrency() { const cores = [2, 4, 6, 8, 12, 16]; return cores[Math.floor(Math.random() * cores.length)]; }
+function generateRandomTouchPoints() { const isMobile = Math.random() > 0.7; if (isMobile) return Math.floor(Math.random() * 5) + 1; return 0; }
+function generateSessionId() { return crypto.randomUUID(); }
+
+function generateBrowserFingerprint() {
+    const resolution = getRandomScreenResolution();
+    return {
+        userAgent: getRandomUserAgent(),
+        webglRenderer: getRandomWebGLRenderer(),
+        webglVendor: getRandomWebGLVendor(),
+        platform: getRandomPlatform(),
+        cpuClass: getRandomCPUClass(),
+        languages: getRandomLanguages(),
+        timezoneOffset: getRandomTimezone(),
+        screenWidth: resolution.width,
+        screenHeight: resolution.height,
+        screenAvailWidth: resolution.width,
+        screenAvailHeight: resolution.height,
+        screenColorDepth: generateRandomColorDepth(),
+        deviceMemory: generateRandomDeviceMemory(),
+        hardwareConcurrency: generateRandomHardwareConcurrency(),
+        touchPoints: generateRandomTouchPoints(),
+        sessionId: generateSessionId(),
+    };
+}
+
+function buildRequestHeaders(fingerprint) {
+    return {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': fingerprint.languages.join(', ') + ';q=0.9',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Content-Type': 'application/json',
+        'Pragma': 'no-cache',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'User-Agent': fingerprint.userAgent,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://t.me/',
+        'Origin': 'https://t.me',
+    };
+}
+
+function loadGroqKey() {
+    try {
+        if (fs.existsSync('grok.txt')) {
+            const key = fs.readFileSync('grok.txt', 'utf8').trim();
+            if (key && key.startsWith('gsk_')) return key;
+        }
+    } catch (e) {}
+    return null;
+}
+
+async function askGroq(eventTitle, odds0, odds1) {
+    if (!groqApiKey) return null;
+    try {
+        const noOddsStr  = (odds0 * 100).toFixed(1);
+        const yesOddsStr = (odds1 * 100).toFixed(1);
+        const noPct  = parseFloat(noOddsStr);
+        const yesPct = parseFloat(yesOddsStr);
+
+        const marketFavorite = yesPct > noPct ? 'YES' : (noPct > yesPct ? 'NO' : 'EVEN');
+        const spread = Math.abs(yesPct - noPct).toFixed(1);
+        const isLopsided = Math.max(yesPct, noPct) > 70;
+        const isClose    = Math.abs(yesPct - noPct) < 10;
+
+        const systemPrompt = `You are an expert prediction market analyst with deep knowledge of sports, finance, politics, crypto, and general world events. You are highly accurate at predicting binary outcomes.
+
+Your analysis process:
+1. Parse the event title carefully — identify the subject, the condition, and the time reference if any.
+2. Apply domain knowledge: historical base rates, known trends, recent context.
+3. Evaluate the current market odds — the crowd is often right but sometimes overreacts.
+4. Assess if the market is efficient or if there is an edge (mispricing).
+5. Produce a calibrated confidence score based on your certainty, not just the odds.
+
+Output rules:
+- Respond ONLY with a valid JSON object. No markdown, no explanation outside JSON.
+- Format exactly: {"answer": "yes", "confidence": 0.78, "reason": "brief reason max 12 words", "edge": "brief 1-line edge explanation"}
+- answer: "yes" or "no" only
+- confidence: float 0.50–0.97 (never 1.0, never below 0.50)
+- Calibrate confidence to your actual certainty. High confidence (>0.80) only when very sure.
+- edge: explain in ≤8 words why the market may be wrong, or "market correct" if efficient`;
+
+        const userPrompt = `Prediction event to analyze:
+
+TITLE: "${eventTitle}"
+
+MARKET ODDS:
+  NO  = ${noOddsStr}%  (crowd says NO with this probability)
+  YES = ${yesOddsStr}%  (crowd says YES with this probability)
+
+MARKET SIGNALS:
+  Favorite: ${marketFavorite}
+  Spread: ${spread}% difference
+  ${isLopsided ? '⚠ Market is heavily one-sided (>70%). Check if crowd is overconfident.' : ''}
+  ${isClose ? '⚠ Market is very close (<10% spread). Small informational edge matters most.' : ''}
+
+Step-by-step:
+1. What does the event literally ask?
+2. What is the most likely real-world outcome based on facts/history?
+3. Does the crowd pricing (${noOddsStr}% NO / ${yesOddsStr}% YES) seem accurate, overpriced, or underpriced?
+4. What is your final answer and why?
+
+Respond with JSON only.`;
+
+        const response = await axios.post(GROQ_API_URL, {
+            model: GROQ_MODEL,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user',   content: userPrompt },
+            ],
+            temperature: 0.15,
+            max_tokens: 180,
+            top_p: 0.9,
+        }, {
+            headers: {
+                'Authorization': `Bearer ${groqApiKey}`,
+                'Content-Type': 'application/json',
+            },
+            timeout: 15000,
+        });
+
+        const text = response.data?.choices?.[0]?.message?.content?.trim();
+        if (!text) return null;
+
+        const clean = text.replace(/```json|```/g, '').trim();
+
+        let parsed;
+        try {
+            parsed = JSON.parse(clean);
+        } catch (e) {
+            const jsonMatch = clean.match(/\{[\s\S]*\}/);
+            if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+            else return null;
+        }
+
+        if (parsed.answer !== 'yes' && parsed.answer !== 'no') return null;
+
+        let confidence = parseFloat(parsed.confidence) || 0.6;
+        confidence = Math.min(0.97, Math.max(0.50, confidence));
+
+        if (isClose && confidence > 0.75) confidence = 0.75;
+
+        return {
+            answer: parsed.answer === 'yes' ? 1 : 0,
+            confidence,
+            reason: (parsed.reason || '').slice(0, 60),
+            edge: (parsed.edge || '').slice(0, 50),
+        };
+    } catch (e) {}
+    return null;
+}
+
+function getProxyAgent(proxyUrl) {
+    if (!proxyUrl) return null;
+    try {
+        if (proxyUrl.toLowerCase().startsWith('socks')) {
+            return new SocksProxyAgent(proxyUrl);
+        } else {
+            return new HttpsProxyAgent(proxyUrl);
+        }
+    } catch (e) {
+        return null;
+    }
+}
+
+function loadProxies() {
+    try {
+        if (fs.existsSync('proxies.txt')) {
+            return fs.readFileSync('proxies.txt', 'utf8')
+                .split('\n')
+                .map(l => l.trim())
+                .filter(l => l && !l.startsWith('#') && l.length > 0);
+        }
+    } catch (e) {}
+    return [];
+}
+
+async function testProxy(proxyUrl) {
+    const agent = getProxyAgent(proxyUrl);
+    if (!agent) return false;
+    try {
+        const response = await axios.get('https://api.ipify.org?format=json', {
+            httpsAgent: agent,
+            httpAgent: agent,
+            timeout: 10000,
+        });
+        if (response.status === 200 && response.data?.ip) {
+            console.log(clr('bGreen', `  ✓ ${proxyUrl.split('@')[1] || proxyUrl} → ${response.data.ip}`));
+            return true;
+        }
+    } catch (e) {
+        console.log(clr('bRed', `  ✗ ${proxyUrl.split('@')[1] || proxyUrl} failed`));
+    }
+    return false;
+}
+
+async function validateAndCleanProxies(proxies) {
+    console.log(clr('bCyan', `\n🔍 Testing ${proxies.length} proxies...\n`));
+    const validProxies = [];
+    for (const proxy of proxies) {
+        if (await testProxy(proxy)) validProxies.push(proxy);
+        await sleep(500);
+    }
+    console.log(clr('bGreen', `\n✓ ${validProxies.length}/${proxies.length} proxies valid\n`));
+    return validProxies;
+}
+
+function autoDelay(baseMs, accountIdx = null) {
+    const accountVariation = accountIdx !== null ? (accountIdx * 137) % 1000 : 0;
     const jitter = baseMs * 0.4;
-    return baseMs - jitter + Math.random() * jitter * 2;
+    return baseMs - jitter + (Math.random() * jitter * 2) + accountVariation;
+}
+
+function randomAccountDelay(idx) {
+    const base = 5000 + Math.random() * 10000;
+    return Math.floor(base + idx * (3000 + Math.random() * 7000));
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function formatTime(seconds) {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-}
 
 function formatDuration(ms) {
     const totalSec = Math.floor(ms / 1000);
@@ -54,12 +320,6 @@ function formatDuration(ms) {
 function ts() {
     const now = new Date();
     return clr('gray', `[${now.toTimeString().slice(0,8)}]`);
-}
-
-function bar(value, max, width = 18) {
-    const filled = Math.round((value / Math.max(max, 1)) * width);
-    const empty  = width - filled;
-    return clr('bGreen', '█'.repeat(Math.max(0, filled))) + clr('gray', '░'.repeat(Math.max(0, empty)));
 }
 
 function printBanner() {
@@ -77,7 +337,7 @@ function printBanner() {
         console.log(clr('bCyan', '║') + clr('cyan', l) + clr('bCyan', '║'));
     }
     console.log(clr('bCyan', '╠' + '═'.repeat(w) + '╣'));
-    const sub = '  🎯  AUTO BETTING BOT  v3.0  ·  Multi-Account  ·  Smart Value Bets  ';
+    const sub = '  🎯  AUTO BETTING BOT  v4.1  ·  Multi-Account  ·  AI-Powered  ';
     console.log(clr('bCyan', '║') + clr('bYellow', sub.padEnd(w)) + clr('bCyan', '║'));
     console.log(clr('bCyan', '╚' + '═'.repeat(w) + '╝') + '\n');
 }
@@ -85,81 +345,19 @@ function printBanner() {
 function sectionHeader(title, color = 'bCyan') {
     const w = 62;
     const inner = ` ${title} `;
-    const side  = Math.floor((w - inner.length) / 2);
-    const rest  = w - side - inner.length;
+    const side = Math.floor((w - inner.length) / 2);
+    const rest = w - side - inner.length;
     console.log('\n' + clr(color, '─'.repeat(Math.max(0, side)) + inner + '─'.repeat(Math.max(0, rest))));
 }
 
-function logInfo(idx, msg)  { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${msg}`); }
-function logOk(idx, msg)    { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bGreen','✔')} ${msg}`); }
-function logErr(idx, msg)   { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bRed','✘')} ${msg}`); }
-function logWarn(idx, msg)  { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bYellow','⚠')} ${msg}`); }
-function logBet(idx, msg)   { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bCyan','🎲')} ${msg}`); }
-function logSleep(msg)      { console.log(`\n${ts()} ${clr('bMagenta','😴')} ${clr('bMagenta', msg)}`); }
-function logWake(msg)       { console.log(`\n${ts()} ${clr('bGreen','⏰')} ${clr('bGreen', msg)}\n`); }
-
-function showStats(idx, userName) {
-    const s       = accountStats[idx] || {};
-    const runtime = Math.floor((Date.now() - (s.startTime || Date.now())) / 1000);
-    const winRate = (s.totalBets || 0) > 0 ? (((s.totalWins || 0) / s.totalBets) * 100).toFixed(1) : '0.0';
-    const net     = (s.totalPointsEarned || 0) - (s.totalPointsSpent || 0);
-    const bets    = loadActiveBets(idx);
-    const wR      = parseFloat(winRate);
-
-    sectionHeader(`📊 ACCOUNT #${idx + 1}  ·  ${userName || 'Unknown'}`, 'bBlue');
-    console.log(
-        `  ${clr('gray','⏱  Runtime')}  ${clr('bWhite', formatTime(runtime))}   ` +
-        `${clr('gray','·')}  ${clr('gray','Bet size')}  ${clr('bYellow', config.betAmount + ' PTS')}`
-    );
-    console.log(
-        `  ${clr('gray','🎯 Bets')}     ${clr('bWhite', String(s.totalBets||0).padEnd(5))}` +
-        `  ${clr('bGreen','✔ '+(s.totalWins||0))}  ${clr('bRed','✘ '+(s.totalLosses||0))}  ` +
-        `WR: ${clr(wR>=55?'bGreen':wR>=40?'bYellow':'bRed', winRate+'%')}  ${bar(wR, 100, 14)}`
-    );
-    console.log(
-        `  ${clr('gray','💸 Spent')}    ${clr('yellow', (s.totalPointsSpent||0)+' PTS')}   ` +
-        `${clr('gray','·')}  ${clr('gray','Earned')}  ${clr('bGreen', (s.totalPointsEarned||0)+' PTS')}`
-    );
-    console.log(
-        `  ${clr('gray','📈 Net P&L')}  ${clr(net>=0?'bGreen':'bRed', bold((net>=0?'+':'')+net+' PTS'))}   ` +
-        `${clr('gray','·')}  ${clr('gray','Active bets')}  ${clr('bCyan', Object.keys(bets).length)}`
-    );
-    console.log(clr('blue', '─'.repeat(62)));
-}
-
-function showGlobalStats() {
-    let totalBets = 0, totalWins = 0, totalLosses = 0, totalSpent = 0, totalEarned = 0;
-    for (const s of Object.values(accountStats)) {
-        totalBets   += s.totalBets    || 0;
-        totalWins   += s.totalWins    || 0;
-        totalLosses += s.totalLosses  || 0;
-        totalSpent  += s.totalPointsSpent  || 0;
-        totalEarned += s.totalPointsEarned || 0;
-    }
-    const winRate = totalBets > 0 ? ((totalWins/totalBets)*100).toFixed(1) : '0.0';
-    const net     = totalEarned - totalSpent;
-    const w       = 62;
-
-    console.log('\n' + clr('bMagenta', '╔' + '═'.repeat(w) + '╗'));
-    console.log(clr('bMagenta', '║') + clr('bWhite', bold('  🌐 GLOBAL SUMMARY'.padEnd(w))) + clr('bMagenta', '║'));
-    console.log(clr('bMagenta', '╠' + '─'.repeat(w) + '╣'));
-    const row = (label, value, vc = 'bWhite') =>
-        console.log(
-            clr('bMagenta','║') +
-            clr('gray', `  ${label}`.padEnd(22)) +
-            clr(vc, String(value).padEnd(w-22)) +
-            clr('bMagenta','║')
-        );
-    row('👥 Accounts',    queries.filter(Boolean).length);
-    row('🎯 Total Bets',  totalBets);
-    row('✔  Wins',        totalWins,   'bGreen');
-    row('✘  Losses',      totalLosses, 'bRed');
-    row('📊 Win Rate',    winRate+'%', parseFloat(winRate)>=50?'bGreen':'bYellow');
-    row('💸 Total Spent', totalSpent+' PTS', 'yellow');
-    row('💵 Total Earned',totalEarned+' PTS','bGreen');
-    row('📈 Net P&L',     (net>=0?'+':'')+net+' PTS', net>=0?'bGreen':'bRed');
-    console.log(clr('bMagenta', '╚' + '═'.repeat(w) + '╝') + '\n');
-}
+function logInfo(idx, msg) { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${msg}`); }
+function logOk(idx, msg)   { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bGreen','✔')} ${msg}`); }
+function logErr(idx, msg)  { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bRed','✘')} ${msg}`); }
+function logWarn(idx, msg) { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bYellow','⚠')} ${msg}`); }
+function logBet(idx, msg)  { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bCyan','🎲')} ${msg}`); }
+function logAI(idx, msg)   { console.log(`${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bMagenta','🤖')} ${msg}`); }
+function logSleep(msg)     { console.log(`\n${ts()} ${clr('bMagenta','😴')} ${clr('bMagenta', msg)}`); }
+function logWake(msg)      { console.log(`\n${ts()} ${clr('bGreen','⏰')} ${clr('bGreen', msg)}\n`); }
 
 function normalizeQuery(raw) {
     if (!raw) return null;
@@ -196,7 +394,7 @@ function saveQuery(query) {
     if (!existing.includes(query)) fs.appendFileSync('query.txt', query + '\n');
 }
 
-function getAccountKey(idx)  { return `account_${idx}`; }
+function getAccountKey(idx) { return `account_${idx}`; }
 
 function loadActiveBets(idx) {
     try {
@@ -229,55 +427,119 @@ function generateUUID() {
     });
 }
 
-async function apiRequest(idx, endpoint, method = 'GET', data = null) {
+async function apiRequest(idx, endpoint, method = 'GET', data = null, retryCount = 0) {
     const query = queries[idx];
     if (!query) throw new Error('No query for account #' + (idx + 1));
     const token = Buffer.from(query).toString('base64');
+
+    const fingerprint = accountStats[idx]?.fingerprint || generateBrowserFingerprint();
+    if (!accountStats[idx]?.fingerprint) {
+        if (!accountStats[idx]) accountStats[idx] = {};
+        accountStats[idx].fingerprint = fingerprint;
+    }
+
+    const headers = buildRequestHeaders(fingerprint);
+    headers['Authorization'] = `Bearer ${token}`;
+
+    let proxyAgent = null;
+    if (config.useProxies && activeProxies.length > 0) {
+        if (currentProxyIndex[idx] === undefined) {
+            currentProxyIndex[idx] = idx % activeProxies.length;
+        }
+        const proxy = activeProxies[currentProxyIndex[idx]];
+        proxyAgent = getProxyAgent(proxy);
+    }
+
     try {
         const response = await axios({
             method,
             url: `${API_BASE}${endpoint}`,
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
+            headers,
             data,
+            httpsAgent: proxyAgent,
+            httpAgent: proxyAgent,
             timeout: 15000,
             validateStatus: false
         });
-        if (response.status !== 200) {
-            logWarn(idx, `${endpoint} → HTTP ${response.status}`);
+
+        if (response.status === 401 || response.status === 403) {
+            queries[idx] = null;
         }
+
+        if (config.useProxies && proxyFailCount[idx] > 0) {
+            proxyFailCount[idx] = 0;
+        }
+
         return response;
     } catch (error) {
+        if (config.useProxies && config.rotateProxyOnError && retryCount < config.maxRetriesPerRequest) {
+            proxyFailCount[idx] = (proxyFailCount[idx] || 0) + 1;
+
+            if (activeProxies.length > 1) {
+                currentProxyIndex[idx] = (currentProxyIndex[idx] + 1) % activeProxies.length;
+            }
+
+            if (proxyFailCount[idx] >= config.maxProxyFails && activeProxies.length > 1) {
+                const badProxy = activeProxies[currentProxyIndex[idx]];
+                activeProxies = activeProxies.filter(p => p !== badProxy);
+                currentProxyIndex[idx] = Math.floor(Math.random() * activeProxies.length);
+                proxyFailCount[idx] = 0;
+            }
+
+            await sleep(autoDelay(3000 + (retryCount * 2000), idx));
+            return apiRequest(idx, endpoint, method, data, retryCount + 1);
+        }
+
         if (error.response?.status === 401) {
-            logErr(idx, 'Query expired, removing account.');
             queries[idx] = null;
         }
         throw error;
     }
 }
 
-async function getUserProfile(idx)          { return (await apiRequest(idx, '/user/profile')).data.data; }
-async function loadEvents(idx)              { return (await apiRequest(idx, '/events/load')).data.data; }
+async function getUserProfile(idx) { return (await apiRequest(idx, '/user/profile')).data.data; }
+async function loadEvents(idx) { return (await apiRequest(idx, '/events/load')).data.data; }
 async function getEventPrices(idx, eventId) {
     try { return (await apiRequest(idx, `/events/prices/${eventId}`)).data.data; } catch (e) { return null; }
 }
 
+async function decideAnswer(idx, event, priceData) {
+    const odds0 = priceData?.prices?.[0] ?? 0.5;
+    const odds1 = priceData?.prices?.[1] ?? 0.5;
+    const title = event.title || event.id || '';
+
+    if (useGroq && groqApiKey) {
+        const result = await askGroq(title, odds0, odds1);
+        if (result) {
+            const edgePart = result.edge ? ` · ${clr('gray', result.edge)}` : '';
+            logAI(idx, `${clr('bMagenta', result.answer === 1 ? 'YES' : 'NO')} · conf ${(result.confidence * 100).toFixed(0)}% · ${result.reason}${edgePart}`);
+            return result.answer;
+        }
+        logWarn(idx, 'Groq failed, falling back to odds strategy');
+    }
+
+    if (priceData?.prices) {
+        const underdogProb = Math.min(odds0, odds1);
+        if (underdogProb > 0.15 && underdogProb < 0.4) {
+            return odds0 < odds1 ? 0 : 1;
+        } else {
+            return odds0 < odds1 ? (Math.random() < 0.55 ? 0 : 1) : (Math.random() < 0.55 ? 1 : 0);
+        }
+    }
+    return Math.random() > 0.5 ? 0 : 1;
+}
+
 async function placeBet(idx, eventId, amount, answer) {
     const direction = answer === 1 ? 'right' : 'left';
-    const type      = answer === 1 ? 'yes'   : 'no';
+    const type = answer === 1 ? 'yes' : 'no';
     logBet(idx, `Placing ${clr('bYellow', amount + ' PTS')} on ${clr('bCyan', type.toUpperCase())}`);
     try {
-        const userData      = await getUserProfile(idx);
+        const userData = await getUserProfile(idx);
         const balanceBefore = userData.points?.amount || 0;
-        const betId         = generateUUID();
         let noOdds = 153, yesOdds = 10;
-        const priceData     = await getEventPrices(idx, eventId);
+        const priceData = await getEventPrices(idx, eventId);
         if (priceData?.prices) {
-            noOdds  = Math.round(priceData.prices[0] * 100) || noOdds;
+            noOdds = Math.round(priceData.prices[0] * 100) || noOdds;
             yesOdds = Math.round(priceData.prices[1] * 100) || yesOdds;
         }
         const response = await apiRequest(idx, '/events/submit', 'POST', {
@@ -293,7 +555,7 @@ async function placeBet(idx, eventId, amount, answer) {
             } catch (e) {}
             const bets = loadActiveBets(idx);
             bets[eventId] = {
-                id: betId, amount, answer, direction, type,
+                id: generateUUID(), amount, answer, direction, type,
                 answerText: type.toUpperCase(),
                 placedAt: new Date().toISOString(),
                 eventTitle, balanceAtBetTime: balanceBefore,
@@ -303,10 +565,7 @@ async function placeBet(idx, eventId, amount, answer) {
             accountStats[idx].totalBets++;
             accountStats[idx].totalPointsSpent += amount;
             saveActiveBets(idx, bets);
-            logOk(idx, `Bet placed · ${clr('bWhite', eventTitle.slice(0,38))} · Odds NO=${noOdds} YES=${yesOdds}`);
-            if (response.data?.data?.user?.points) {
-                logInfo(idx, `Balance → ${clr('bGreen', response.data.data.user.points.amount + ' PTS')}`);
-            }
+            logOk(idx, `Bet placed · ${clr('bWhite', eventTitle.slice(0,38))}`);
             if (response.data?.data?.events) await checkResolvedBets(idx, response.data.data.events);
             return true;
         } else {
@@ -322,11 +581,11 @@ async function placeBet(idx, eventId, amount, answer) {
 async function checkResolvedBets(idx, currentEvents) {
     const bets = loadActiveBets(idx);
     if (Object.keys(bets).length === 0) return;
-    logInfo(idx, `Checking ${clr('bCyan', Object.keys(bets).length)} active bets...`);
-    const userData        = await getUserProfile(idx);
-    const currentBalance  = userData.points?.amount || 0;
+    logInfo(idx, `Checking ${Object.keys(bets).length} active bets...`);
+    const userData = await getUserProfile(idx);
+    const currentBalance = userData.points?.amount || 0;
     const currentEventIds = new Set(currentEvents.map(e => e.id));
-    let wins = 0, losses = 0, stillActive = {}, totalProfit = 0;
+    let wins = 0, losses = 0, stillActive = {};
     if (!accountStats[idx]) accountStats[idx] = { totalBets: 0, totalWins: 0, totalLosses: 0, totalPointsSpent: 0, totalPointsEarned: 0, startTime: Date.now() };
     const history = loadBetHistory(idx);
     for (const [eventId, bet] of Object.entries(bets)) {
@@ -336,21 +595,20 @@ async function checkResolvedBets(idx, currentEvents) {
                 wins++;
                 accountStats[idx].totalWins++;
                 accountStats[idx].totalPointsEarned += balanceChange;
-                totalProfit += balanceChange;
-                logOk(idx, `WIN  ${clr('bWhite', (bet.eventTitle||eventId).slice(0,30))} → ${clr('bGreen','+'+balanceChange+' PTS')}`);
-                history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'win', profit: balanceChange, finalBalance: currentBalance });
+                logOk(idx, `WIN  ${(bet.eventTitle||eventId).slice(0,30)} → +${balanceChange} PTS`);
+                history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'win', profit: balanceChange });
             } else {
                 losses++;
                 accountStats[idx].totalLosses++;
-                logErr(idx, `LOSS ${clr('white', (bet.eventTitle||eventId).slice(0,30))}`);
-                history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'loss', finalBalance: currentBalance });
+                logErr(idx, `LOSS ${(bet.eventTitle||eventId).slice(0,30)}`);
+                history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'loss' });
             }
         } else {
             stillActive[eventId] = bet;
         }
     }
     if (wins > 0 || losses > 0) {
-        logInfo(idx, `Resolved → ${clr('bGreen','+'+wins+' wins')}  ${clr('bRed',losses+' losses')}  net ${clr('bCyan','+'+totalProfit+' PTS')}`);
+        logInfo(idx, `Resolved → +${wins} wins  ${losses} losses`);
     }
     saveActiveBets(idx, stillActive);
     saveBetHistory(idx, history);
@@ -360,6 +618,18 @@ async function runAccount(idx) {
     if (!queries[idx]) { logWarn(idx, 'Invalid query, skipping.'); return; }
     if (!accountStats[idx]) accountStats[idx] = { totalBets: 0, totalWins: 0, totalLosses: 0, totalPointsSpent: 0, totalPointsEarned: 0, startTime: Date.now() };
 
+    const fingerprint = generateBrowserFingerprint();
+    accountStats[idx].fingerprint = fingerprint;
+
+    if (config.useProxies && activeProxies.length > 0) {
+        if (currentProxyIndex[idx] === undefined) {
+            currentProxyIndex[idx] = idx % activeProxies.length;
+        }
+        const assignedProxy = activeProxies[currentProxyIndex[idx]];
+        const proxyHost = assignedProxy.split('@')[1]?.split(':')[0] || assignedProxy;
+        logInfo(idx, `Proxy: ${clr('bCyan', proxyHost)}`);
+    }
+
     sectionHeader(`▶  STARTING ACCOUNT #${idx + 1}`, 'bGreen');
 
     let userData;
@@ -367,12 +637,12 @@ async function runAccount(idx) {
     catch (e) { logErr(idx, `Failed to get profile: ${e.message}`); return; }
 
     const userName = userData.name || `Account #${idx + 1}`;
-    let balance    = userData.points?.amount || 0;
-    logOk(idx, `User: ${clr('bWhite', bold(userName))}  Balance: ${clr('bGreen', balance + ' PTS')}`);
+    let balance = userData.points?.amount || 0;
+    logOk(idx, `User: ${bold(userName)}  Balance: ${balance} PTS`);
 
-    let cycleCount          = 0;
+    let cycleCount = 0;
     let consecutiveNoEvents = 0;
-    const MAX_CONSECUTIVE   = 2;
+    const MAX_CONSECUTIVE = 2;
 
     while (true) {
         if (!queries[idx]) { logWarn(idx, 'Query removed, stopping.'); break; }
@@ -380,37 +650,31 @@ async function runAccount(idx) {
             cycleCount++;
             console.log(`\n${ts()} ${clr('bBlue','[#'+(idx+1)+']')} ${clr('bYellow','━━ CYCLE #'+cycleCount+' ━━')}`);
 
-            const eventData  = await loadEvents(idx);
-            const events     = eventData.events || [];
+            const eventData = await loadEvents(idx);
+            const events = eventData.events || [];
             await checkResolvedBets(idx, events);
 
             userData = await getUserProfile(idx);
-            balance  = userData.points?.amount || 0;
+            balance = userData.points?.amount || 0;
 
             if (balance < config.minBalanceToBet) {
-                logWarn(idx, `Balance too low (${clr('bRed', balance + ' PTS')}). Waiting 5 min...`);
-                await sleep(autoDelay(300000));
+                logWarn(idx, `Balance too low (${balance} PTS). Waiting...`);
+                await sleep(autoDelay(300000, idx));
                 continue;
             }
 
-            const currentBets  = loadActiveBets(idx);
+            const currentBets = loadActiveBets(idx);
             const activeEvents = events.filter(e => !e.is_closed && !currentBets[e.id]);
 
-            logInfo(idx,
-                `Events: ${clr('bWhite', events.length)} total  ` +
-                `${clr('bCyan', activeEvents.length)} available  ` +
-                `${clr('bYellow', Object.keys(currentBets).length)} active  ` +
-                `Balance: ${clr('bGreen', balance + ' PTS')}`
-            );
+            logInfo(idx, `Events: ${events.length} total  ${activeEvents.length} available  Active: ${Object.keys(currentBets).length}  Balance: ${balance} PTS`);
 
             if (activeEvents.length === 0) {
                 consecutiveNoEvents++;
-                logInfo(idx, `No new events (${consecutiveNoEvents}/${MAX_CONSECUTIVE})`);
                 if (consecutiveNoEvents >= MAX_CONSECUTIVE) {
                     logOk(idx, 'All events processed. Done for this cycle.');
                     break;
                 }
-                await sleep(autoDelay(30000));
+                await sleep(autoDelay(30000, idx));
                 continue;
             }
 
@@ -425,47 +689,23 @@ async function runAccount(idx) {
                 const freshBets = loadActiveBets(idx);
                 if (freshBets[event.id]) continue;
 
-                logInfo(idx, `Event: ${clr('bWhite', (event.title || event.id).slice(0,52))}`);
+                logInfo(idx, `Event: ${(event.title || event.id).slice(0,52)}`);
 
                 const priceData = await getEventPrices(idx, event.id);
-                let answer;
-                if (priceData?.prices) {
-                    const odds0 = priceData.prices[0];
-                    const odds1 = priceData.prices[1];
-                    logInfo(idx, `Odds: ${clr('bYellow', (odds0*100).toFixed(1)+'%')} / ${clr('bYellow', (odds1*100).toFixed(1)+'%')}`);
-                    if (odds0 > 0.99 || odds0 < 0.01 || odds1 > 0.99 || odds1 < 0.01) {
-                        logInfo(idx, clr('gray', 'Market decided — skipping.'));
-                        continue;
-                    }
-                    const underdogProb = Math.min(odds0, odds1);
-                    if (underdogProb > 0.15 && underdogProb < 0.4) {
-                        answer = odds0 < odds1 ? 0 : 1;
-                        logInfo(idx, `Strategy: ${clr('bMagenta','Value bet')} on ${answer===1?'YES':'NO'} (underdog)`);
-                    } else {
-                        answer = odds0 < odds1 ? (Math.random() < 0.55 ? 0 : 1) : (Math.random() < 0.55 ? 1 : 0);
-                        logInfo(idx, `Strategy: ${clr('bBlue','Weighted random')}`);
-                    }
-                } else {
-                    answer = Math.random() > 0.5 ? 0 : 1;
-                    logInfo(idx, `Strategy: ${clr('gray','Random (no price data)')}`);
-                }
+                const answer = await decideAnswer(idx, event, priceData);
 
                 const success = await placeBet(idx, event.id, config.betAmount, answer);
                 if (success) betsPlaced++;
-                await sleep(autoDelay(2500));
+                await sleep(autoDelay(2500 + Math.random() * 3000, idx));
             }
 
             if (betsPlaced === 0) {
                 logWarn(idx, 'No bets placed this cycle.');
             } else {
-                logOk(idx, `Placed ${clr('bCyan', betsPlaced)} bets  Active: ${clr('bCyan', Object.keys(loadActiveBets(idx)).length)}`);
+                logOk(idx, `Placed ${betsPlaced} bets`);
             }
 
-            showStats(idx, userName);
-
-            const breakMs = autoDelay(15000);
-            logInfo(idx, `Short break: ${clr('gray', formatDuration(breakMs))}`);
-            await sleep(breakMs);
+            await sleep(autoDelay(15000, idx));
 
         } catch (error) {
             if (error.message && error.message.includes("Cannot read properties of null")) {
@@ -473,76 +713,153 @@ async function runAccount(idx) {
                 break;
             }
             logErr(idx, `Cycle error: ${error.message}`);
-            await sleep(autoDelay(30000));
+            await sleep(autoDelay(30000, idx));
         }
     }
 }
 
 async function sleepWithCountdown(ms) {
-    const endTime       = Date.now() + ms;
-    const intervalMs    = 30 * 60 * 1000;
-    logSleep(`Sleeping ${clr('bYellow', formatDuration(ms))} until next run...`);
+    const endTime = Date.now() + ms;
+    const intervalMs = 30 * 60 * 1000;
+    logSleep(`Sleeping ${formatDuration(ms)} until next run...`);
     while (Date.now() < endTime) {
         const remaining = endTime - Date.now();
         if (remaining <= 0) break;
         await sleep(Math.min(intervalMs, remaining));
         const stillLeft = endTime - Date.now();
         if (stillLeft > 5000) {
-            logSleep(`Next run in ${clr('bYellow', formatDuration(stillLeft))}...`);
+            logSleep(`Next run in ${formatDuration(stillLeft)}...`);
         }
     }
 }
 
-async function setup() {
+async function showMenu() {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q) => new Promise(resolve => rl.question(q, a => resolve(a.trim())));
+
+    console.clear();
     printBanner();
-    const rl  = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const ask = q => new Promise(resolve => rl.question(q, a => resolve(a.trim())));
-    const betAmountRaw = await ask(clr('bYellow', '💰 Bet amount per event (default 5 PTS): '));
-    rl.close();
+
+    // Groq setup
+    groqApiKey = loadGroqKey();
+    if (groqApiKey) {
+        console.log(clr('bGreen', `  ✓ Groq API key loaded from grok.txt`));
+        const groqChoice = await ask(clr('bYellow', '🤖 Use Groq AI for bet decisions? (y/n): '));
+        useGroq = groqChoice.toLowerCase() === 'y';
+        if (useGroq) {
+            console.log(clr('bGreen', `  ✓ Groq AI enabled · model: ${GROQ_MODEL}`));
+        } else {
+            console.log(clr('bYellow', '  ➜ Using odds-based strategy'));
+        }
+    } else {
+        console.log(clr('bYellow', '  ⚠ grok.txt not found or invalid — using odds strategy'));
+        useGroq = false;
+    }
+
+    console.log('');
+
+    // Proxy setup
+    console.log(clr('bCyan', '  ╔════════════════════════════════════════════╗'));
+    console.log(clr('bCyan', '  ║') + clr('bWhite', '           PROXY CONFIGURATION                ') + clr('bCyan', '║'));
+    console.log(clr('bCyan', '  ╠════════════════════════════════════════════╣'));
+    console.log(clr('bCyan', '  ║') + clr('bGreen', '  1. ') + clr('white', 'No Proxy (Direct Connection)           ') + clr('bCyan', '║'));
+    console.log(clr('bCyan', '  ║') + clr('bGreen', '  2. ') + clr('white', 'Use Proxies from proxies.txt            ') + clr('bCyan', '║'));
+    console.log(clr('bCyan', '  ╚════════════════════════════════════════════╝\n'));
+
+    const choice = await ask(clr('bYellow', '➤ Select option (1 or 2): '));
+
+    if (choice === '2') {
+        config.useProxies = true;
+        proxyList = loadProxies();
+
+        if (proxyList.length > 0) {
+            console.log(clr('bGreen', `\n  ✓ Loaded ${proxyList.length} proxies`));
+
+            const validate = await ask(clr('bYellow', 'Validate proxies before using? (y/n): '));
+            if (validate.toLowerCase() === 'y') {
+                activeProxies = await validateAndCleanProxies(proxyList);
+                if (activeProxies.length === 0) {
+                    console.log(clr('bRed', '\n  ✗ No valid proxies found! Running without proxies.'));
+                    config.useProxies = false;
+                } else {
+                    console.log(clr('bGreen', `\n  ✓ ${activeProxies.length} valid proxies ready`));
+                    const rotateChoice = await ask(clr('bYellow', 'Auto-rotate on failure? (y/n): '));
+                    config.rotateProxyOnError = rotateChoice.toLowerCase() === 'y';
+                }
+            } else {
+                activeProxies = proxyList;
+                console.log(clr('bGreen', `  ✓ ${activeProxies.length} proxies ready`));
+                const rotateChoice = await ask(clr('bYellow', 'Auto-rotate on failure? (y/n): '));
+                config.rotateProxyOnError = rotateChoice.toLowerCase() === 'y';
+            }
+        } else {
+            console.log(clr('bRed', '\n  ✗ No proxies found in proxies.txt!'));
+            const useAnyway = await ask(clr('bYellow', 'Run without proxies? (y/n): '));
+            if (useAnyway.toLowerCase() !== 'y') {
+                console.log(clr('bRed', 'Exiting...'));
+                process.exit(0);
+            }
+            config.useProxies = false;
+        }
+    } else {
+        config.useProxies = false;
+        console.log(clr('bGreen', '\n  ✓ Running without proxies'));
+    }
+
+    const betAmountRaw = await ask(clr('bYellow', '\n💰 Bet amount per event (default 5 PTS): '));
     config.betAmount = parseInt(betAmountRaw) || 5;
-    console.log(`\n  ${clr('bGreen','✔')} Config → Bet amount: ${clr('bYellow', bold(config.betAmount + ' PTS'))}\n`);
+
+    console.log(clr('bGreen', '\n  ✓ Configuration complete!'));
+    console.log(clr('bGreen', `  ✓ Bet amount: ${config.betAmount} PTS`));
+    console.log(clr('bGreen', `  ✓ AI mode: ${useGroq ? 'Groq (' + GROQ_MODEL + ')' : 'Odds strategy'}`));
+    console.log(clr('bGreen', `  ✓ Proxy mode: ${config.useProxies ? 'Enabled (' + activeProxies.length + ' proxies)' : 'Disabled'}`));
+    if (config.useProxies) {
+        console.log(clr('bGreen', `  ✓ Auto-rotate: ${config.rotateProxyOnError ? 'ON' : 'OFF'}`));
+    }
+
+    await sleep(2000);
+    rl.close();
 }
 
 async function main() {
-    await setup();
+    await showMenu();
 
     let runCount = 0;
+
+    console.clear();
+    printBanner();
 
     while (true) {
         runCount++;
         queries = loadQueries();
 
         if (queries.length === 0) {
-            const rl    = readline.createInterface({ input: process.stdin, output: process.stdout });
+            const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
             const query = await new Promise(resolve =>
-                rl.question(clr('bYellow', '📝 Paste your query data: '), a => { rl.close(); resolve(normalizeQuery(a)); })
+                rl.question(clr('bYellow', '\n📝 Paste your query data: '), a => { rl.close(); resolve(normalizeQuery(a)); })
             );
             saveQuery(query);
             queries = [query];
         }
 
-        sectionHeader(`🚀  RUN #${runCount}  ·  ${queries.filter(Boolean).length} account(s)  ·  ${new Date().toLocaleString()}`, 'bGreen');
-        queries.forEach((q, i) => {
-            console.log(`  ${clr('gray','#'+(i+1))}  ${q ? clr('gray', q.substring(0, 60)+'...') : clr('bRed','INVALID')}`);
-        });
+        sectionHeader(`🚀  RUN #${runCount}  ·  ${queries.length} account(s)`, 'bGreen');
         console.log('');
-
-        const statsInterval = setInterval(() => showGlobalStats(), 5 * 60 * 1000);
 
         await Promise.all(
             queries.map((_, idx) =>
                 (async () => {
-                    await sleep(idx * autoDelay(4000));
+                    if (idx > 0) {
+                        const delay = randomAccountDelay(idx);
+                        logInfo(idx, `Starting in ${Math.round(delay / 1000)}s...`);
+                        await sleep(delay);
+                    }
                     await runAccount(idx);
                 })()
             )
         );
 
-        clearInterval(statsInterval);
-        showGlobalStats();
-
         const sleepHours = 22 + Math.random() * 4;
-        const sleepMs    = Math.floor(sleepHours * 60 * 60 * 1000);
+        const sleepMs = Math.floor(sleepHours * 60 * 60 * 1000);
 
         await sleepWithCountdown(sleepMs);
         logWake(`Waking up! Starting run #${runCount + 1}...`);
@@ -553,19 +870,14 @@ async function main() {
 
 process.on('SIGINT', () => {
     console.log('\n');
-    sectionHeader('🛑  SHUTTING DOWN', 'bRed');
-    for (let i = 0; i < queries.length; i++) {
-        saveActiveBets(i, loadActiveBets(i));
-        saveBetHistory(i, loadBetHistory(i));
-    }
-    showGlobalStats();
-    console.log(clr('bGreen', '  ✔ State saved. Goodbye.\n'));
+    console.log(clr('bGreen', '  ✔ Shutting down...\n'));
     process.exit(0);
 });
 
-process.on('uncaughtException', err => {
-    console.error(clr('bRed', `\n❌ Uncaught error: ${err.message}`));
-    for (let i = 0; i < queries.length; i++) saveActiveBets(i, loadActiveBets(i));
+process.on('uncaughtException', (err) => {
+    console.error(clr('bRed', `\n❌ Error: ${err.message}`));
 });
+
+console.log(clr('bYellow', '⚠️  Make sure to install: npm install axios socks-proxy-agent https-proxy-agent\n'));
 
 main().catch(console.error);
