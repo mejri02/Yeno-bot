@@ -17,6 +17,7 @@ let proxyFailCount = {};
 let activeProxies = [];
 let groqApiKey = null;
 let useGroq = false;
+let predictionHistory = [];
 
 let config = {
     betAmount: 5,
@@ -26,18 +27,18 @@ let config = {
     maxRetriesPerRequest: 2,
     requestDelay: { min: 2000, max: 8000 },
     maxProxyFails: 3,
+    useEnsembleMethod: true,
+    adjustBetByConfidence: true,
+    minAiConfidence: 0.60,
 };
 
 const C = {
-    reset:   '\x1b[0m',
-    bold:    '\x1b[1m',
-    dim:     '\x1b[2m',
-    black:   '\x1b[30m', red:     '\x1b[31m', green:   '\x1b[32m',
-    yellow:  '\x1b[33m', blue:    '\x1b[34m', magenta: '\x1b[35m',
-    cyan:    '\x1b[36m', white:   '\x1b[37m', gray:    '\x1b[90m',
-    bRed:    '\x1b[91m', bGreen:  '\x1b[92m', bYellow: '\x1b[93m',
-    bBlue:   '\x1b[94m', bMagenta:'\x1b[95m', bCyan:   '\x1b[96m',
-    bWhite:  '\x1b[97m',
+    reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
+    black: '\x1b[30m', red: '\x1b[31m', green: '\x1b[32m',
+    yellow: '\x1b[33m', blue: '\x1b[34m', magenta: '\x1b[35m',
+    cyan: '\x1b[36m', white: '\x1b[37m', gray: '\x1b[90m',
+    bRed: '\x1b[91m', bGreen: '\x1b[92m', bYellow: '\x1b[93m',
+    bBlue: '\x1b[94m', bMagenta: '\x1b[95m', bCyan: '\x1b[96m', bWhite: '\x1b[97m',
 };
 
 function clr(color, text) {
@@ -50,28 +51,66 @@ function bold(text) { return `${C.bold}${text}${C.reset}`; }
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/122.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
     'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 12; SM-A525F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 13; SM-N986B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Edg/120.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Edg/119.0.0.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Edg/120.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 OPR/105.0.0.0',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/120.0.6099.119 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/121.0.6167.37 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (iPad; CPU OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
 ];
 
 const WEBGL_RENDERERS = [
     'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)',
     'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)',
     'ANGLE (AMD, Radeon RX 580 Direct3D11 vs_5_0 ps_5_0)',
+    'ANGLE (Intel, Intel(R) Iris Xe Graphics Direct3D11 vs_5_0 ps_5_0)',
+    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)',
+    'ANGLE (AMD, Radeon RX 6800 XT Direct3D11 vs_5_0 ps_5_0)',
 ];
 
-const WEBGL_VENDORS = ['Google Inc. (Intel)', 'NVIDIA Corporation', 'Advanced Micro Devices, Inc.'];
-const PLATFORMS = ['Win32', 'MacIntel', 'Linux x86_64', 'iPhone', 'iPad', 'Android'];
-const CPU_CLASSES = ['x86', 'x86_64', 'ARM', 'ARM64'];
-const LANGUAGES = [['en-US', 'en'], ['en-GB', 'en'], ['zh-CN', 'zh', 'en-US', 'en']];
-const TIMEZONES = [-420, -300, -240, -180, 0, 60, 120, 180, 240, 330, 480, 570];
+const WEBGL_VENDORS = ['Google Inc. (Intel)', 'NVIDIA Corporation', 'Advanced Micro Devices, Inc.', 'Intel Inc.'];
+const PLATFORMS = ['Win32', 'MacIntel', 'Linux x86_64', 'iPhone', 'iPad', 'Android', 'Linux armv8l'];
+const CPU_CLASSES = ['x86', 'x86_64', 'ARM', 'ARM64', 'Intel Core i7', 'AMD Ryzen 5'];
+const LANGUAGES = [['en-US', 'en'], ['en-GB', 'en'], ['zh-CN', 'zh', 'en-US', 'en'], ['es-ES', 'es', 'en'], ['fr-FR', 'fr', 'en']];
+const TIMEZONES = [-420, -300, -240, -180, 0, 60, 120, 180, 240, 330, 480, 570, 660];
 const SCREEN_RESOLUTIONS = [
     { width: 1920, height: 1080 }, { width: 1366, height: 768 },
     { width: 1536, height: 864 }, { width: 1440, height: 900 },
+    { width: 2560, height: 1440 }, { width: 3840, height: 2160 },
+    { width: 1280, height: 720 }, { width: 1600, height: 900 },
 ];
 
 function getRandomUserAgent() { return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]; }
@@ -83,8 +122,8 @@ function getRandomLanguages() { return LANGUAGES[Math.floor(Math.random() * LANG
 function getRandomTimezone() { return TIMEZONES[Math.floor(Math.random() * TIMEZONES.length)]; }
 function getRandomScreenResolution() { return SCREEN_RESOLUTIONS[Math.floor(Math.random() * SCREEN_RESOLUTIONS.length)]; }
 function generateRandomColorDepth() { const depths = [24, 30, 32]; return depths[Math.floor(Math.random() * depths.length)]; }
-function generateRandomDeviceMemory() { const memories = [2, 4, 8, 16]; return memories[Math.floor(Math.random() * memories.length)]; }
-function generateRandomHardwareConcurrency() { const cores = [2, 4, 6, 8, 12, 16]; return cores[Math.floor(Math.random() * cores.length)]; }
+function generateRandomDeviceMemory() { const memories = [2, 4, 8, 16, 32]; return memories[Math.floor(Math.random() * memories.length)]; }
+function generateRandomHardwareConcurrency() { const cores = [2, 4, 6, 8, 12, 16, 24]; return cores[Math.floor(Math.random() * cores.length)]; }
 function generateRandomTouchPoints() { const isMobile = Math.random() > 0.7; if (isMobile) return Math.floor(Math.random() * 5) + 1; return 0; }
 function generateSessionId() { return crypto.randomUUID(); }
 
@@ -135,59 +174,113 @@ function loadGroqKey() {
             const key = fs.readFileSync('grok.txt', 'utf8').trim();
             if (key && key.startsWith('gsk_')) return key;
         }
+        if (fs.existsSync('groq.txt')) {
+            const key = fs.readFileSync('groq.txt', 'utf8').trim();
+            if (key && key.startsWith('gsk_')) return key;
+        }
     } catch (e) {}
     return null;
 }
 
-async function askGroq(eventTitle, odds0, odds1) {
+function loadPredictionHistory() {
+    try {
+        if (fs.existsSync('prediction_history.json')) {
+            return JSON.parse(fs.readFileSync('prediction_history.json', 'utf8'));
+        }
+    } catch (e) {}
+    return [];
+}
+
+function savePredictionHistory(history) {
+    try {
+        fs.writeFileSync('prediction_history.json', JSON.stringify(history.slice(-200), null, 2));
+    } catch (e) {}
+}
+
+function updatePredictionAccuracy() {
+    const history = loadPredictionHistory();
+    if (history.length === 0) return null;
+    const recent = history.slice(-50);
+    const correct = recent.filter(p => p.correct).length;
+    const accuracy = correct / recent.length;
+    return {
+        overall: accuracy,
+        recent20: history.slice(-20).filter(p => p.correct).length / 20,
+        totalPredictions: history.length
+    };
+}
+
+function getCategoryFromTitle(title) {
+    const lower = title.toLowerCase();
+    if (lower.includes('sport') || lower.includes('game') || lower.includes('match') || lower.includes('vs') || lower.includes('win')) return 'sports';
+    if (lower.includes('crypto') || lower.includes('bitcoin') || lower.includes('eth') || lower.includes('price')) return 'crypto';
+    if (lower.includes('election') || lower.includes('president') || lower.includes('vote') || lower.includes('poll')) return 'politics';
+    if (lower.includes('stock') || lower.includes('market') || lower.includes('economy') || lower.includes('fed')) return 'finance';
+    if (lower.includes('weather') || lower.includes('storm') || lower.includes('temperature')) return 'weather';
+    if (lower.includes('tech') || lower.includes('ai') || lower.includes('product') || lower.includes('launch')) return 'technology';
+    return 'general';
+}
+
+function getSpecializedSystemPrompt(category) {
+    const prompts = {
+        sports: `You are a sports betting expert with deep knowledge of all major sports. Consider home field advantage, recent form, head-to-head history, injuries, rest days, motivation, and weather conditions. Be decisive and avoid 50/50 predictions.`,
+        crypto: `You are a cryptocurrency market analyst. Consider technical indicators, market sentiment, news, whale movements, regulatory updates, and macroeconomic factors. Cryptocurrency events have high volatility - adjust confidence accordingly.`,
+        politics: `You are a political analyst specializing in elections. Consider polling data, fundraising, historical patterns, endorsements, debate performances, current events, and voter turnout.`,
+        finance: `You are a financial markets expert. Consider company fundamentals, market trends, economic indicators, Federal Reserve policy, geopolitical events, and analyst ratings.`,
+        general: `You are a prediction market expert with high accuracy. Establish base rate probability, identify market inefficiencies, consider time remaining, look for catalysts, and be decisive.`
+    };
+    return prompts[category] || prompts.general;
+}
+
+async function askGroq(eventTitle, odds0, odds1, retryCount = 0) {
     if (!groqApiKey) return null;
     try {
-        const noOddsStr  = (odds0 * 100).toFixed(1);
+        const category = getCategoryFromTitle(eventTitle);
+        const noOddsStr = (odds0 * 100).toFixed(1);
         const yesOddsStr = (odds1 * 100).toFixed(1);
-        const noPct  = parseFloat(noOddsStr);
+        const noPct = parseFloat(noOddsStr);
         const yesPct = parseFloat(yesOddsStr);
-
         const marketFavorite = yesPct > noPct ? 'YES' : (noPct > yesPct ? 'NO' : 'EVEN');
         const spread = Math.abs(yesPct - noPct).toFixed(1);
-        const isLopsided = Math.max(yesPct, noPct) > 70;
-        const isClose    = Math.abs(yesPct - noPct) < 10;
+        const isLopsided = Math.max(yesPct, noPct) > 75;
+        const isClose = Math.abs(yesPct - noPct) < 12;
+        
+        const accuracyStats = updatePredictionAccuracy();
+        const accuracyNote = accuracyStats && accuracyStats.recent20 > 0.6 
+            ? `\nNote: My recent prediction accuracy is ${(accuracyStats.recent20 * 100).toFixed(0)}% - I'm calibrated.`
+            : '';
+        
+        const systemPrompt = getSpecializedSystemPrompt(category) + `
 
-        const systemPrompt = `You are an expert prediction market analyst with deep knowledge of sports, finance, politics, crypto, and general world events. You are highly accurate at predicting binary outcomes.
+CRITICAL OUTPUT RULES:
+- Respond ONLY with valid JSON. No markdown, no explanations outside JSON.
+- Format: {"answer": "yes", "confidence": 0.75, "reason": "brief reason max 15 words", "edge": "market inefficiency or 'market correct'"}
+- answer: "yes" or "no" ONLY
+- confidence: float between 0.60 and 0.92 (never below 0.60, never above 0.92)
+- Be decisive - avoid 0.50-0.60 range unless truly random event
+- Higher confidence (>0.80) only when very sure
+- Lower confidence (0.60-0.70) for close calls or unpredictable events${accuracyNote}`;
 
-Your analysis process:
-1. Parse the event title carefully — identify the subject, the condition, and the time reference if any.
-2. Apply domain knowledge: historical base rates, known trends, recent context.
-3. Evaluate the current market odds — the crowd is often right but sometimes overreacts.
-4. Assess if the market is efficient or if there is an edge (mispricing).
-5. Produce a calibrated confidence score based on your certainty, not just the odds.
-
-Output rules:
-- Respond ONLY with a valid JSON object. No markdown, no explanation outside JSON.
-- Format exactly: {"answer": "yes", "confidence": 0.78, "reason": "brief reason max 12 words", "edge": "brief 1-line edge explanation"}
-- answer: "yes" or "no" only
-- confidence: float 0.50–0.97 (never 1.0, never below 0.50)
-- Calibrate confidence to your actual certainty. High confidence (>0.80) only when very sure.
-- edge: explain in ≤8 words why the market may be wrong, or "market correct" if efficient`;
-
-        const userPrompt = `Prediction event to analyze:
+        const userPrompt = `PREDICTION EVENT ANALYSIS
 
 TITLE: "${eventTitle}"
+CATEGORY: ${category.toUpperCase()}
 
-MARKET ODDS:
-  NO  = ${noOddsStr}%  (crowd says NO with this probability)
-  YES = ${yesOddsStr}%  (crowd says YES with this probability)
+CURRENT MARKET ODDS:
+- NO: ${noOddsStr}% (market says event will NOT happen)
+- YES: ${yesOddsStr}% (market says event WILL happen)
 
 MARKET SIGNALS:
-  Favorite: ${marketFavorite}
-  Spread: ${spread}% difference
-  ${isLopsided ? '⚠ Market is heavily one-sided (>70%). Check if crowd is overconfident.' : ''}
-  ${isClose ? '⚠ Market is very close (<10% spread). Small informational edge matters most.' : ''}
+- Favorite: ${marketFavorite}
+- Spread: ${spread}% difference between outcomes
+${isLopsided ? '- ⚠️ Market is heavily one-sided (>75%) - potential overconfidence' : ''}
+${isClose ? '- ⚠️ Market is very close (<12% spread) - informational edge is critical' : ''}
 
-Step-by-step:
-1. What does the event literally ask?
-2. What is the most likely real-world outcome based on facts/history?
-3. Does the crowd pricing (${noOddsStr}% NO / ${yesOddsStr}% YES) seem accurate, overpriced, or underpriced?
-4. What is your final answer and why?
+ANALYSIS STEPS:
+1. What is the base rate for this type of event?
+2. Is the market overconfident or underconfident?
+3. What specific factors could change the outcome?
+4. Your final prediction with confidence
 
 Respond with JSON only.`;
 
@@ -195,11 +288,11 @@ Respond with JSON only.`;
             model: GROQ_MODEL,
             messages: [
                 { role: 'system', content: systemPrompt },
-                { role: 'user',   content: userPrompt },
+                { role: 'user', content: userPrompt },
             ],
-            temperature: 0.15,
-            max_tokens: 180,
-            top_p: 0.9,
+            temperature: 0.2,
+            max_tokens: 200,
+            top_p: 0.85,
         }, {
             headers: {
                 'Authorization': `Bearer ${groqApiKey}`,
@@ -212,7 +305,6 @@ Respond with JSON only.`;
         if (!text) return null;
 
         const clean = text.replace(/```json|```/g, '').trim();
-
         let parsed;
         try {
             parsed = JSON.parse(clean);
@@ -224,19 +316,38 @@ Respond with JSON only.`;
 
         if (parsed.answer !== 'yes' && parsed.answer !== 'no') return null;
 
-        let confidence = parseFloat(parsed.confidence) || 0.6;
-        confidence = Math.min(0.97, Math.max(0.50, confidence));
-
-        if (isClose && confidence > 0.75) confidence = 0.75;
+        let confidence = parseFloat(parsed.confidence) || 0.65;
+        confidence = Math.min(0.92, Math.max(0.60, confidence));
+        
+        if (isClose && confidence > 0.80) confidence = 0.75;
+        if (isLopsided && confidence < 0.70) confidence = 0.70;
+        
+        if (accuracyStats && accuracyStats.recent20 > 0.65) {
+            confidence = Math.min(0.92, confidence + 0.02);
+        } else if (accuracyStats && accuracyStats.recent20 < 0.55) {
+            confidence = Math.max(0.60, confidence - 0.03);
+        }
 
         return {
             answer: parsed.answer === 'yes' ? 1 : 0,
             confidence,
             reason: (parsed.reason || '').slice(0, 60),
             edge: (parsed.edge || '').slice(0, 50),
+            category
         };
-    } catch (e) {}
-    return null;
+        
+    } catch (error) {
+        if (retryCount === 0) {
+            console.log(clr('bYellow', `  ⚠️ Groq API error: ${error.message}, retrying...`));
+            await sleep(2000);
+            return askGroq(eventTitle, odds0, odds1, retryCount + 1);
+        }
+        return null;
+    }
+}
+
+async function askGroqWithRetry(eventTitle, odds0, odds1) {
+    return await askGroq(eventTitle, odds0, odds1, 0);
 }
 
 function getProxyAgent(proxyUrl) {
@@ -337,7 +448,7 @@ function printBanner() {
         console.log(clr('bCyan', '║') + clr('cyan', l) + clr('bCyan', '║'));
     }
     console.log(clr('bCyan', '╠' + '═'.repeat(w) + '╣'));
-    const sub = '  🎯  AUTO BETTING BOT  v4.1  ·  Multi-Account  ·  AI-Powered  ';
+    const sub = '  🎯  AUTO BETTING BOT  v5.0  ·  AI-Powered  ·  Enhanced Accuracy  ';
     console.log(clr('bCyan', '║') + clr('bYellow', sub.padEnd(w)) + clr('bCyan', '║'));
     console.log(clr('bCyan', '╚' + '═'.repeat(w) + '╝') + '\n');
 }
@@ -507,17 +618,64 @@ async function decideAnswer(idx, event, priceData) {
     const odds0 = priceData?.prices?.[0] ?? 0.5;
     const odds1 = priceData?.prices?.[1] ?? 0.5;
     const title = event.title || event.id || '';
-
+    
+    let groqResult = null;
     if (useGroq && groqApiKey) {
-        const result = await askGroq(title, odds0, odds1);
-        if (result) {
-            const edgePart = result.edge ? ` · ${clr('gray', result.edge)}` : '';
-            logAI(idx, `${clr('bMagenta', result.answer === 1 ? 'YES' : 'NO')} · conf ${(result.confidence * 100).toFixed(0)}% · ${result.reason}${edgePart}`);
-            return result.answer;
+        groqResult = await askGroqWithRetry(title, odds0, odds1);
+        if (groqResult) {
+            const edgePart = groqResult.edge ? ` · ${clr('gray', groqResult.edge)}` : '';
+            logAI(idx, `${clr('bMagenta', groqResult.answer === 1 ? 'YES' : 'NO')} · conf ${(groqResult.confidence * 100).toFixed(0)}% · ${groqResult.reason}${edgePart}`);
+            
+            predictionHistory.push({
+                timestamp: Date.now(),
+                eventTitle: title.slice(0, 50),
+                category: groqResult.category,
+                predicted: groqResult.answer,
+                confidence: groqResult.confidence,
+                marketYes: odds1,
+                marketNo: odds0
+            });
+            savePredictionHistory(predictionHistory);
+        } else {
+            logWarn(idx, 'Groq failed, falling back to strategy');
         }
-        logWarn(idx, 'Groq failed, falling back to odds strategy');
     }
-
+    
+    if (config.useEnsembleMethod && groqResult) {
+        const marketPrediction = odds1 > odds0 ? 1 : 0;
+        const marketStrength = Math.abs(odds1 - odds0);
+        
+        let aiWeight = 0.6;
+        if (groqResult.confidence > 0.8) aiWeight = 0.75;
+        if (groqResult.confidence < 0.65) aiWeight = 0.45;
+        
+        const finalScore = (groqResult.answer * aiWeight) + (marketPrediction * (1 - aiWeight));
+        const finalAnswer = finalScore > 0.5 ? 1 : 0;
+        
+        if (groqResult.answer === marketPrediction) {
+            logAI(idx, `🤝 AI & market agree · ${groqResult.answer === 1 ? 'YES' : 'NO'}`);
+        } else {
+            logAI(idx, `⚡ AI vs market · AI:${groqResult.answer === 1 ? 'YES' : 'NO'} vs Market:${marketPrediction === 1 ? 'YES' : 'NO'} · Following ${finalAnswer === groqResult.answer ? 'AI' : 'market'}`);
+        }
+        
+        if (!accountStats[idx]) accountStats[idx] = {};
+        if (!accountStats[idx].predictions) accountStats[idx].predictions = [];
+        accountStats[idx].predictions.push({
+            eventId: event.id,
+            aiPrediction: groqResult.answer,
+            aiConfidence: groqResult.confidence,
+            marketPrediction,
+            finalAnswer,
+            timestamp: Date.now()
+        });
+        
+        return finalAnswer;
+    }
+    
+    if (groqResult && (groqResult.confidence > config.minAiConfidence || !config.useEnsembleMethod)) {
+        return groqResult.answer;
+    }
+    
     if (priceData?.prices) {
         const underdogProb = Math.min(odds0, odds1);
         if (underdogProb > 0.15 && underdogProb < 0.4) {
@@ -529,23 +687,45 @@ async function decideAnswer(idx, event, priceData) {
     return Math.random() > 0.5 ? 0 : 1;
 }
 
-async function placeBet(idx, eventId, amount, answer) {
+async function placeBet(idx, eventId, amount, answer, confidence = null) {
     const direction = answer === 1 ? 'right' : 'left';
     const type = answer === 1 ? 'yes' : 'no';
-    logBet(idx, `Placing ${clr('bYellow', amount + ' PTS')} on ${clr('bCyan', type.toUpperCase())}`);
+    
+    let finalAmount = amount;
+    if (config.adjustBetByConfidence && confidence) {
+        if (confidence > 0.85) {
+            finalAmount = Math.floor(amount * 1.5);
+            logAI(idx, `📈 High confidence (${Math.round(confidence*100)}%) → increased bet to ${finalAmount} PTS`);
+        } else if (confidence < 0.65) {
+            finalAmount = Math.floor(amount * 0.5);
+            logAI(idx, `📉 Low confidence (${Math.round(confidence*100)}%) → reduced bet to ${finalAmount} PTS`);
+        }
+    }
+    
+    logBet(idx, `Placing ${clr('bYellow', finalAmount + ' PTS')} on ${clr('bCyan', type.toUpperCase())}`);
+    
     try {
         const userData = await getUserProfile(idx);
         const balanceBefore = userData.points?.amount || 0;
+        
+        const maxBet = Math.floor(balanceBefore * 0.25);
+        if (finalAmount > maxBet) {
+            finalAmount = Math.max(amount, Math.floor(maxBet));
+            logWarn(idx, `Bet capped at ${finalAmount} PTS (25% of balance)`);
+        }
+        
         let noOdds = 153, yesOdds = 10;
         const priceData = await getEventPrices(idx, eventId);
         if (priceData?.prices) {
             noOdds = Math.round(priceData.prices[0] * 100) || noOdds;
             yesOdds = Math.round(priceData.prices[1] * 100) || yesOdds;
         }
+        
         const response = await apiRequest(idx, '/events/submit', 'POST', {
             id: eventId, direction, type,
-            prices: { amount, no: noOdds, yes: yesOdds }
+            prices: { amount: finalAmount, no: noOdds, yes: yesOdds }
         });
+        
         if (response.status === 200 && response.data?.code === 200) {
             let eventTitle = 'Unknown';
             try {
@@ -553,19 +733,37 @@ async function placeBet(idx, eventId, amount, answer) {
                 const ev = events.events?.find(e => e.id === eventId);
                 if (ev) eventTitle = ev.title || ev.id;
             } catch (e) {}
+            
             const bets = loadActiveBets(idx);
             bets[eventId] = {
-                id: generateUUID(), amount, answer, direction, type,
+                id: generateUUID(),
+                amount: finalAmount,
+                answer,
+                direction,
+                type,
                 answerText: type.toUpperCase(),
                 placedAt: new Date().toISOString(),
-                eventTitle, balanceAtBetTime: balanceBefore,
-                odds: { no: noOdds, yes: yesOdds }
+                eventTitle,
+                balanceAtBetTime: balanceBefore,
+                odds: { no: noOdds, yes: yesOdds },
+                aiConfidence: confidence || null
             };
-            if (!accountStats[idx]) accountStats[idx] = { totalBets: 0, totalWins: 0, totalLosses: 0, totalPointsSpent: 0, totalPointsEarned: 0, startTime: Date.now() };
+            
+            if (!accountStats[idx]) {
+                accountStats[idx] = { 
+                    totalBets: 0, totalWins: 0, totalLosses: 0, 
+                    totalPointsSpent: 0, totalPointsEarned: 0, 
+                    startTime: Date.now(),
+                    aiPredictions: 0,
+                    aiCorrect: 0
+                };
+            }
             accountStats[idx].totalBets++;
-            accountStats[idx].totalPointsSpent += amount;
+            accountStats[idx].totalPointsSpent += finalAmount;
+            if (confidence) accountStats[idx].aiPredictions++;
             saveActiveBets(idx, bets);
             logOk(idx, `Bet placed · ${clr('bWhite', eventTitle.slice(0,38))}`);
+            
             if (response.data?.data?.events) await checkResolvedBets(idx, response.data.data.events);
             return true;
         } else {
@@ -581,13 +779,19 @@ async function placeBet(idx, eventId, amount, answer) {
 async function checkResolvedBets(idx, currentEvents) {
     const bets = loadActiveBets(idx);
     if (Object.keys(bets).length === 0) return;
+    
     logInfo(idx, `Checking ${Object.keys(bets).length} active bets...`);
     const userData = await getUserProfile(idx);
     const currentBalance = userData.points?.amount || 0;
     const currentEventIds = new Set(currentEvents.map(e => e.id));
     let wins = 0, losses = 0, stillActive = {};
-    if (!accountStats[idx]) accountStats[idx] = { totalBets: 0, totalWins: 0, totalLosses: 0, totalPointsSpent: 0, totalPointsEarned: 0, startTime: Date.now() };
+    
+    if (!accountStats[idx]) {
+        accountStats[idx] = { totalBets: 0, totalWins: 0, totalLosses: 0, totalPointsSpent: 0, totalPointsEarned: 0, startTime: Date.now() };
+    }
+    
     const history = loadBetHistory(idx);
+    
     for (const [eventId, bet] of Object.entries(bets)) {
         if (!currentEventIds.has(eventId)) {
             const balanceChange = currentBalance - (bet.balanceAtBetTime - bet.amount);
@@ -595,7 +799,15 @@ async function checkResolvedBets(idx, currentEvents) {
                 wins++;
                 accountStats[idx].totalWins++;
                 accountStats[idx].totalPointsEarned += balanceChange;
-                logOk(idx, `WIN  ${(bet.eventTitle||eventId).slice(0,30)} → +${balanceChange} PTS`);
+                
+                if (bet.aiConfidence) {
+                    accountStats[idx].aiCorrect++;
+                    const aiAccuracy = (accountStats[idx].aiCorrect / accountStats[idx].aiPredictions) * 100;
+                    logOk(idx, `WIN  ${(bet.eventTitle||eventId).slice(0,30)} → +${balanceChange} PTS · 🤖 AI accuracy: ${aiAccuracy.toFixed(1)}%`);
+                } else {
+                    logOk(idx, `WIN  ${(bet.eventTitle||eventId).slice(0,30)} → +${balanceChange} PTS`);
+                }
+                
                 history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'win', profit: balanceChange });
             } else {
                 losses++;
@@ -607,16 +819,34 @@ async function checkResolvedBets(idx, currentEvents) {
             stillActive[eventId] = bet;
         }
     }
+    
     if (wins > 0 || losses > 0) {
-        logInfo(idx, `Resolved → +${wins} wins  ${losses} losses`);
+        const winRate = accountStats[idx].totalBets > 0 
+            ? (accountStats[idx].totalWins / accountStats[idx].totalBets * 100).toFixed(1)
+            : 0;
+        logInfo(idx, `Resolved → +${wins} wins / ${losses} losses · Win rate: ${winRate}%`);
+        
+        if (accountStats[idx].aiPredictions > 0) {
+            const aiAccuracy = (accountStats[idx].aiCorrect / accountStats[idx].aiPredictions * 100).toFixed(1);
+            logInfo(idx, `🤖 AI record: ${accountStats[idx].aiCorrect}/${accountStats[idx].aiPredictions} (${aiAccuracy}%)`);
+        }
     }
+    
     saveActiveBets(idx, stillActive);
     saveBetHistory(idx, history);
 }
 
 async function runAccount(idx) {
     if (!queries[idx]) { logWarn(idx, 'Invalid query, skipping.'); return; }
-    if (!accountStats[idx]) accountStats[idx] = { totalBets: 0, totalWins: 0, totalLosses: 0, totalPointsSpent: 0, totalPointsEarned: 0, startTime: Date.now() };
+    if (!accountStats[idx]) {
+        accountStats[idx] = { 
+            totalBets: 0, totalWins: 0, totalLosses: 0, 
+            totalPointsSpent: 0, totalPointsEarned: 0, 
+            startTime: Date.now(),
+            aiPredictions: 0,
+            aiCorrect: 0
+        };
+    }
 
     const fingerprint = generateBrowserFingerprint();
     accountStats[idx].fingerprint = fingerprint;
@@ -639,6 +869,11 @@ async function runAccount(idx) {
     const userName = userData.name || `Account #${idx + 1}`;
     let balance = userData.points?.amount || 0;
     logOk(idx, `User: ${bold(userName)}  Balance: ${balance} PTS`);
+    
+    const accuracyStats = updatePredictionAccuracy();
+    if (accuracyStats && accuracyStats.recent20) {
+        logInfo(idx, `🤖 Global AI accuracy (last 20): ${(accuracyStats.recent20 * 100).toFixed(1)}%`);
+    }
 
     let cycleCount = 0;
     let consecutiveNoEvents = 0;
@@ -692,9 +927,14 @@ async function runAccount(idx) {
                 logInfo(idx, `Event: ${(event.title || event.id).slice(0,52)}`);
 
                 const priceData = await getEventPrices(idx, event.id);
-                const answer = await decideAnswer(idx, event, priceData);
+                const result = await decideAnswer(idx, event, priceData);
+                
+                let confidence = null;
+                if (useGroq && groqApiKey) {
+                    confidence = result.confidence || null;
+                }
 
-                const success = await placeBet(idx, event.id, config.betAmount, answer);
+                const success = await placeBet(idx, event.id, config.betAmount, result.answer || result, confidence);
                 if (success) betsPlaced++;
                 await sleep(autoDelay(2500 + Math.random() * 3000, idx));
             }
@@ -740,14 +980,21 @@ async function showMenu() {
     console.clear();
     printBanner();
 
-    // Groq setup
+    predictionHistory = loadPredictionHistory();
+    const accuracyStats = updatePredictionAccuracy();
+    
     groqApiKey = loadGroqKey();
     if (groqApiKey) {
         console.log(clr('bGreen', `  ✓ Groq API key loaded from grok.txt`));
+        if (accuracyStats && accuracyStats.totalPredictions > 0) {
+            console.log(clr('bCyan', `  📊 Historical AI accuracy: ${(accuracyStats.overall * 100).toFixed(1)}% (${accuracyStats.totalPredictions} predictions)`));
+        }
         const groqChoice = await ask(clr('bYellow', '🤖 Use Groq AI for bet decisions? (y/n): '));
         useGroq = groqChoice.toLowerCase() === 'y';
         if (useGroq) {
             console.log(clr('bGreen', `  ✓ Groq AI enabled · model: ${GROQ_MODEL}`));
+            console.log(clr('bGreen', `  ✓ Ensemble method (AI + market): ENABLED by default`));
+            console.log(clr('bGreen', `  ✓ Confidence-based betting: ENABLED by default`));
         } else {
             console.log(clr('bYellow', '  ➜ Using odds-based strategy'));
         }
@@ -758,7 +1005,6 @@ async function showMenu() {
 
     console.log('');
 
-    // Proxy setup
     console.log(clr('bCyan', '  ╔════════════════════════════════════════════╗'));
     console.log(clr('bCyan', '  ║') + clr('bWhite', '           PROXY CONFIGURATION                ') + clr('bCyan', '║'));
     console.log(clr('bCyan', '  ╠════════════════════════════════════════════╣'));
@@ -812,6 +1058,10 @@ async function showMenu() {
     console.log(clr('bGreen', '\n  ✓ Configuration complete!'));
     console.log(clr('bGreen', `  ✓ Bet amount: ${config.betAmount} PTS`));
     console.log(clr('bGreen', `  ✓ AI mode: ${useGroq ? 'Groq (' + GROQ_MODEL + ')' : 'Odds strategy'}`));
+    if (useGroq) {
+        console.log(clr('bGreen', `  ✓ Ensemble method: ON (AI + market combination)`));
+        console.log(clr('bGreen', `  ✓ Confidence-based betting: ON (adjusts bet size)`));
+    }
     console.log(clr('bGreen', `  ✓ Proxy mode: ${config.useProxies ? 'Enabled (' + activeProxies.length + ' proxies)' : 'Disabled'}`));
     if (config.useProxies) {
         console.log(clr('bGreen', `  ✓ Auto-rotate: ${config.rotateProxyOnError ? 'ON' : 'OFF'}`));
