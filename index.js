@@ -614,6 +614,16 @@ async function getEventPrices(idx, eventId) {
     try { return (await apiRequest(idx, `/events/prices/${eventId}`)).data.data; } catch (e) { return null; }
 }
 
+function getCategoryAccuracy(category) {
+    try {
+        const history = loadPredictionHistory();
+        const catHistory = history.filter(p => p.category === category && typeof p.correct === 'boolean');
+        if (catHistory.length < 5) return null; // not enough data
+        const recent = catHistory.slice(-30);
+        return recent.filter(p => p.correct).length / recent.length;
+    } catch (e) { return null; }
+}
+
 async function decideAnswer(idx, event, priceData) {
     const odds0 = priceData?.prices?.[0] ?? 0.5;
     const odds1 = priceData?.prices?.[1] ?? 0.5;
@@ -633,7 +643,8 @@ async function decideAnswer(idx, event, priceData) {
                 predicted: groqResult.answer,
                 confidence: groqResult.confidence,
                 marketYes: odds1,
-                marketNo: odds0
+                marketNo: odds0,
+                correct: null  // will be back-filled when event resolves
             });
             savePredictionHistory(predictionHistory);
         } else {
@@ -645,9 +656,13 @@ async function decideAnswer(idx, event, priceData) {
         const marketPrediction = odds1 > odds0 ? 1 : 0;
         const marketStrength = Math.abs(odds1 - odds0);
         
+        // Adaptive AI weight: boost if category accuracy is high
+        const catAccuracy = getCategoryAccuracy(groqResult.category);
         let aiWeight = 0.6;
         if (groqResult.confidence > 0.8) aiWeight = 0.75;
         if (groqResult.confidence < 0.65) aiWeight = 0.45;
+        if (catAccuracy !== null && catAccuracy > 0.65) aiWeight = Math.min(0.85, aiWeight + 0.10);
+        if (catAccuracy !== null && catAccuracy < 0.45) aiWeight = Math.max(0.30, aiWeight - 0.15);
         
         const finalScore = (groqResult.answer * aiWeight) + (marketPrediction * (1 - aiWeight));
         const finalAnswer = finalScore > 0.5 ? 1 : 0;
@@ -669,22 +684,20 @@ async function decideAnswer(idx, event, priceData) {
             timestamp: Date.now()
         });
         
-        return finalAnswer;
+        // Return object with answer + confidence so bet sizing works correctly
+        return { answer: finalAnswer, confidence: groqResult.confidence };
     }
     
     if (groqResult && (groqResult.confidence > config.minAiConfidence || !config.useEnsembleMethod)) {
-        return groqResult.answer;
+        return { answer: groqResult.answer, confidence: groqResult.confidence };
     }
     
+    // Fallback: pure odds-based, no random noise
     if (priceData?.prices) {
-        const underdogProb = Math.min(odds0, odds1);
-        if (underdogProb > 0.15 && underdogProb < 0.4) {
-            return odds0 < odds1 ? 0 : 1;
-        } else {
-            return odds0 < odds1 ? (Math.random() < 0.55 ? 0 : 1) : (Math.random() < 0.55 ? 1 : 0);
-        }
+        const favorite = odds1 > odds0 ? 1 : 0;
+        return { answer: favorite, confidence: null };
     }
-    return Math.random() > 0.5 ? 0 : 1;
+    return { answer: Math.random() > 0.5 ? 0 : 1, confidence: null };
 }
 
 async function placeBet(idx, eventId, amount, answer, confidence = null) {
@@ -795,7 +808,8 @@ async function checkResolvedBets(idx, currentEvents) {
     for (const [eventId, bet] of Object.entries(bets)) {
         if (!currentEventIds.has(eventId)) {
             const balanceChange = currentBalance - (bet.balanceAtBetTime - bet.amount);
-            if (balanceChange > bet.amount * 0.5) {
+            const isWin = balanceChange > bet.amount * 0.5;
+            if (isWin) {
                 wins++;
                 accountStats[idx].totalWins++;
                 accountStats[idx].totalPointsEarned += balanceChange;
@@ -814,6 +828,18 @@ async function checkResolvedBets(idx, currentEvents) {
                 accountStats[idx].totalLosses++;
                 logErr(idx, `LOSS ${(bet.eventTitle||eventId).slice(0,30)}`);
                 history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'loss' });
+            }
+            
+            // Back-fill prediction history outcome so accuracy tracking works
+            const ph = loadPredictionHistory();
+            const matchIdx = ph.findLastIndex(p => 
+                p.eventTitle && bet.eventTitle && 
+                p.eventTitle.slice(0,30) === (bet.eventTitle||'').slice(0,30) &&
+                p.predicted === bet.answer
+            );
+            if (matchIdx !== -1) {
+                ph[matchIdx].correct = isWin;
+                savePredictionHistory(ph);
             }
         } else {
             stillActive[eventId] = bet;
@@ -929,12 +955,11 @@ async function runAccount(idx) {
                 const priceData = await getEventPrices(idx, event.id);
                 const result = await decideAnswer(idx, event, priceData);
                 
-                let confidence = null;
-                if (useGroq && groqApiKey) {
-                    confidence = result.confidence || null;
-                }
+                // result is always { answer, confidence } - extract correctly
+                const answer = (result && typeof result === 'object') ? result.answer : result;
+                const confidence = (result && typeof result === 'object') ? result.confidence : null;
 
-                const success = await placeBet(idx, event.id, config.betAmount, result.answer || result, confidence);
+                const success = await placeBet(idx, event.id, config.betAmount, answer, confidence);
                 if (success) betsPlaced++;
                 await sleep(autoDelay(2500 + Math.random() * 3000, idx));
             }
