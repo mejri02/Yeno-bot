@@ -7,7 +7,57 @@ const crypto = require('crypto');
 
 const API_BASE = 'https://api.yeno.pro/tma/v1';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
+// Updated to use currently active Groq models
+const GROQ_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'gemma2-9b-it'];
+let GROQ_MODEL = GROQ_MODELS[0]; // kept for display/logging compatibility
+let groqModelIndex = 0;
+
+async function callGroqWithFallback(payload, timeout) {
+    let lastErr;
+    const totalKeys = groqApiKeys.length || 1;
+
+    for (let k = 0; k < totalKeys; k++) {
+        const keyToTry = groqApiKeys[(groqKeyIndex + k) % totalKeys];
+        if (!keyToTry) throw new Error('No Groq API key available');
+
+        const headers = {
+            'Authorization': `Bearer ${keyToTry}`,
+            'Content-Type': 'application/json',
+        };
+
+        let authFailed = false;
+
+        for (let i = 0; i < GROQ_MODELS.length; i++) {
+            const modelToTry = GROQ_MODELS[(groqModelIndex + i) % GROQ_MODELS.length];
+            try {
+                const res = await axios.post(GROQ_API_URL, { ...payload, model: modelToTry }, { headers, timeout });
+                // success — lock in whichever key/model combo worked
+                groqKeyIndex = (groqKeyIndex + k) % totalKeys;
+                groqApiKey = keyToTry;
+                groqModelIndex = (groqModelIndex + i) % GROQ_MODELS.length;
+                GROQ_MODEL = modelToTry;
+                return res;
+            } catch (err) {
+                lastErr = err;
+                const status = err.response?.status;
+
+                if (status === 401 || status === 403) {
+                    // key itself is bad — stop trying other models on this key, rotate to next key
+                    authFailed = true;
+                    console.log(clr('bYellow', `  ⚠ Groq key #${(groqKeyIndex + k) % totalKeys + 1} rejected (${status}) — rotating to next key...`));
+                    break;
+                }
+
+                const retriable = status === 429 || status === 400 || status === 404 || status >= 500;
+                if (!retriable) throw err; // network error etc — don't burn through fallbacks
+                console.log(clr('bYellow', `  ⚠ Groq model "${modelToTry}" failed (${status || err.message}) — trying next model...`));
+            }
+        }
+
+        if (!authFailed) break; // model fallback exhausted for a non-auth reason, no point rotating keys further
+    }
+    throw lastErr;
+}
 
 let queries = [];
 let accountStats = {};
@@ -15,7 +65,9 @@ let proxyList = [];
 let currentProxyIndex = {};
 let proxyFailCount = {};
 let activeProxies = [];
-let groqApiKey = null;
+let groqApiKeys = [];
+let groqKeyIndex = 0;
+let groqApiKey = null; // kept for compatibility — always mirrors groqApiKeys[groqKeyIndex]
 let useGroq = false;
 let predictionHistory = [];
 
@@ -168,18 +220,20 @@ function buildRequestHeaders(fingerprint) {
     };
 }
 
-function loadGroqKey() {
+function loadGroqKeys() {
+    const keys = [];
     try {
-        if (fs.existsSync('grok.txt')) {
-            const key = fs.readFileSync('grok.txt', 'utf8').trim();
-            if (key && key.startsWith('gsk_')) return key;
-        }
-        if (fs.existsSync('groq.txt')) {
-            const key = fs.readFileSync('groq.txt', 'utf8').trim();
-            if (key && key.startsWith('gsk_')) return key;
+        for (const file of ['grok.txt', 'groq.txt']) {
+            if (fs.existsSync(file)) {
+                const lines = fs.readFileSync(file, 'utf8').split('\n');
+                for (const line of lines) {
+                    const key = line.trim();
+                    if (key && key.startsWith('gsk_') && !keys.includes(key)) keys.push(key);
+                }
+            }
         }
     } catch (e) {}
-    return null;
+    return keys;
 }
 
 function loadPredictionHistory() {
@@ -233,7 +287,7 @@ function getSpecializedSystemPrompt(category) {
 }
 
 async function askGroq(eventTitle, odds0, odds1, retryCount = 0) {
-    if (!groqApiKey) return null;
+    if (groqApiKeys.length === 0) return null;
     try {
         const category = getCategoryFromTitle(eventTitle);
         const noOddsStr = (odds0 * 100).toFixed(1);
@@ -284,22 +338,18 @@ ANALYSIS STEPS:
 
 Respond with JSON only.`;
 
-        const response = await axios.post(GROQ_API_URL, {
-            model: GROQ_MODEL,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt },
-            ],
-            temperature: 0.2,
-            max_tokens: 200,
-            top_p: 0.85,
-        }, {
-            headers: {
-                'Authorization': `Bearer ${groqApiKey}`,
-                'Content-Type': 'application/json',
+        const response = await callGroqWithFallback(
+            {
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                ],
+                temperature: 0.2,
+                max_tokens: 200,
+                top_p: 0.85,
             },
-            timeout: 15000,
-        });
+            15000
+        );
 
         const text = response.data?.choices?.[0]?.message?.content?.trim();
         if (!text) return null;
@@ -614,6 +664,16 @@ async function getEventPrices(idx, eventId) {
     try { return (await apiRequest(idx, `/events/prices/${eventId}`)).data.data; } catch (e) { return null; }
 }
 
+function getCategoryAccuracy(category) {
+    try {
+        const history = loadPredictionHistory();
+        const catHistory = history.filter(p => p.category === category && typeof p.correct === 'boolean');
+        if (catHistory.length < 5) return null; // not enough data
+        const recent = catHistory.slice(-30);
+        return recent.filter(p => p.correct).length / recent.length;
+    } catch (e) { return null; }
+}
+
 async function decideAnswer(idx, event, priceData) {
     const odds0 = priceData?.prices?.[0] ?? 0.5;
     const odds1 = priceData?.prices?.[1] ?? 0.5;
@@ -633,7 +693,8 @@ async function decideAnswer(idx, event, priceData) {
                 predicted: groqResult.answer,
                 confidence: groqResult.confidence,
                 marketYes: odds1,
-                marketNo: odds0
+                marketNo: odds0,
+                correct: null  // will be back-filled when event resolves
             });
             savePredictionHistory(predictionHistory);
         } else {
@@ -645,9 +706,13 @@ async function decideAnswer(idx, event, priceData) {
         const marketPrediction = odds1 > odds0 ? 1 : 0;
         const marketStrength = Math.abs(odds1 - odds0);
         
+        // Adaptive AI weight: boost if category accuracy is high
+        const catAccuracy = getCategoryAccuracy(groqResult.category);
         let aiWeight = 0.6;
         if (groqResult.confidence > 0.8) aiWeight = 0.75;
         if (groqResult.confidence < 0.65) aiWeight = 0.45;
+        if (catAccuracy !== null && catAccuracy > 0.65) aiWeight = Math.min(0.85, aiWeight + 0.10);
+        if (catAccuracy !== null && catAccuracy < 0.45) aiWeight = Math.max(0.30, aiWeight - 0.15);
         
         const finalScore = (groqResult.answer * aiWeight) + (marketPrediction * (1 - aiWeight));
         const finalAnswer = finalScore > 0.5 ? 1 : 0;
@@ -669,22 +734,20 @@ async function decideAnswer(idx, event, priceData) {
             timestamp: Date.now()
         });
         
-        return finalAnswer;
+        // Return object with answer + confidence so bet sizing works correctly
+        return { answer: finalAnswer, confidence: groqResult.confidence };
     }
     
     if (groqResult && (groqResult.confidence > config.minAiConfidence || !config.useEnsembleMethod)) {
-        return groqResult.answer;
+        return { answer: groqResult.answer, confidence: groqResult.confidence };
     }
     
+    // Fallback: pure odds-based, no random noise
     if (priceData?.prices) {
-        const underdogProb = Math.min(odds0, odds1);
-        if (underdogProb > 0.15 && underdogProb < 0.4) {
-            return odds0 < odds1 ? 0 : 1;
-        } else {
-            return odds0 < odds1 ? (Math.random() < 0.55 ? 0 : 1) : (Math.random() < 0.55 ? 1 : 0);
-        }
+        const favorite = odds1 > odds0 ? 1 : 0;
+        return { answer: favorite, confidence: null };
     }
-    return Math.random() > 0.5 ? 0 : 1;
+    return { answer: Math.random() > 0.5 ? 0 : 1, confidence: null };
 }
 
 async function placeBet(idx, eventId, amount, answer, confidence = null) {
@@ -795,7 +858,8 @@ async function checkResolvedBets(idx, currentEvents) {
     for (const [eventId, bet] of Object.entries(bets)) {
         if (!currentEventIds.has(eventId)) {
             const balanceChange = currentBalance - (bet.balanceAtBetTime - bet.amount);
-            if (balanceChange > bet.amount * 0.5) {
+            const isWin = balanceChange > bet.amount * 0.5;
+            if (isWin) {
                 wins++;
                 accountStats[idx].totalWins++;
                 accountStats[idx].totalPointsEarned += balanceChange;
@@ -814,6 +878,18 @@ async function checkResolvedBets(idx, currentEvents) {
                 accountStats[idx].totalLosses++;
                 logErr(idx, `LOSS ${(bet.eventTitle||eventId).slice(0,30)}`);
                 history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'loss' });
+            }
+            
+            // Back-fill prediction history outcome so accuracy tracking works
+            const ph = loadPredictionHistory();
+            const matchIdx = ph.findLastIndex(p => 
+                p.eventTitle && bet.eventTitle && 
+                p.eventTitle.slice(0,30) === (bet.eventTitle||'').slice(0,30) &&
+                p.predicted === bet.answer
+            );
+            if (matchIdx !== -1) {
+                ph[matchIdx].correct = isWin;
+                savePredictionHistory(ph);
             }
         } else {
             stillActive[eventId] = bet;
@@ -929,12 +1005,11 @@ async function runAccount(idx) {
                 const priceData = await getEventPrices(idx, event.id);
                 const result = await decideAnswer(idx, event, priceData);
                 
-                let confidence = null;
-                if (useGroq && groqApiKey) {
-                    confidence = result.confidence || null;
-                }
+                // result is always { answer, confidence } - extract correctly
+                const answer = (result && typeof result === 'object') ? result.answer : result;
+                const confidence = (result && typeof result === 'object') ? result.confidence : null;
 
-                const success = await placeBet(idx, event.id, config.betAmount, result.answer || result, confidence);
+                const success = await placeBet(idx, event.id, config.betAmount, answer, confidence);
                 if (success) betsPlaced++;
                 await sleep(autoDelay(2500 + Math.random() * 3000, idx));
             }
@@ -983,16 +1058,17 @@ async function showMenu() {
     predictionHistory = loadPredictionHistory();
     const accuracyStats = updatePredictionAccuracy();
     
-    groqApiKey = loadGroqKey();
-    if (groqApiKey) {
-        console.log(clr('bGreen', `  ✓ Groq API key loaded from grok.txt`));
+    groqApiKeys = loadGroqKeys();
+    groqApiKey = groqApiKeys[0] || null;
+    if (groqApiKeys.length > 0) {
+        console.log(clr('bGreen', `  ✓ Loaded ${groqApiKeys.length} Groq API key(s) from grok.txt${groqApiKeys.length > 1 ? ' (auto-rotate on 401/403 enabled)' : ''}`));
         if (accuracyStats && accuracyStats.totalPredictions > 0) {
             console.log(clr('bCyan', `  📊 Historical AI accuracy: ${(accuracyStats.overall * 100).toFixed(1)}% (${accuracyStats.totalPredictions} predictions)`));
         }
         const groqChoice = await ask(clr('bYellow', '🤖 Use Groq AI for bet decisions? (y/n): '));
         useGroq = groqChoice.toLowerCase() === 'y';
         if (useGroq) {
-            console.log(clr('bGreen', `  ✓ Groq AI enabled · model: ${GROQ_MODEL}`));
+            console.log(clr('bGreen', `  ✓ Groq AI enabled · models: ${GROQ_MODELS.join(' → ')} (auto-fallback)`));
             console.log(clr('bGreen', `  ✓ Ensemble method (AI + market): ENABLED by default`));
             console.log(clr('bGreen', `  ✓ Confidence-based betting: ENABLED by default`));
         } else {
@@ -1057,7 +1133,7 @@ async function showMenu() {
 
     console.log(clr('bGreen', '\n  ✓ Configuration complete!'));
     console.log(clr('bGreen', `  ✓ Bet amount: ${config.betAmount} PTS`));
-    console.log(clr('bGreen', `  ✓ AI mode: ${useGroq ? 'Groq (' + GROQ_MODEL + ')' : 'Odds strategy'}`));
+    console.log(clr('bGreen', `  ✓ AI mode: ${useGroq ? 'Groq (' + GROQ_MODELS.join(' → ') + ')' : 'Odds strategy'}`));
     if (useGroq) {
         console.log(clr('bGreen', `  ✓ Ensemble method: ON (AI + market combination)`));
         console.log(clr('bGreen', `  ✓ Confidence-based betting: ON (adjusts bet size)`));
