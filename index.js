@@ -7,10 +7,29 @@ const crypto = require('crypto');
 
 const API_BASE = 'https://api.yeno.pro/tma/v1';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-// Updated to use currently active Groq models
-const GROQ_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'gemma2-9b-it'];
-let GROQ_MODEL = GROQ_MODELS[0]; // kept for display/logging compatibility
+const GROQ_RESPONSES_API_URL = 'https://api.groq.com/openai/v1/responses';
+
+const GROQ_MODELS = [
+    'groq/compound',
+    'groq/compound-mini',
+    'qwen/qwen3.6-27b',
+    'allam-2-7b'
+];
+
+const GPT_OSS_MODELS = [
+    'openai/gpt-oss-20b',
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-safeguard-20b'
+];
+
+const ALL_MODELS = [...GROQ_MODELS, ...GPT_OSS_MODELS];
+
+let GROQ_MODEL = GROQ_MODELS[0];
 let groqModelIndex = 0;
+
+function isGptOssModel(model) {
+    return model && model.startsWith('openai/gpt-oss');
+}
 
 async function callGroqWithFallback(payload, timeout) {
     let lastErr;
@@ -27,14 +46,29 @@ async function callGroqWithFallback(payload, timeout) {
 
         let authFailed = false;
 
-        for (let i = 0; i < GROQ_MODELS.length; i++) {
-            const modelToTry = GROQ_MODELS[(groqModelIndex + i) % GROQ_MODELS.length];
+        for (let i = 0; i < ALL_MODELS.length; i++) {
+            const modelToTry = ALL_MODELS[(groqModelIndex + i) % ALL_MODELS.length];
             try {
-                const res = await axios.post(GROQ_API_URL, { ...payload, model: modelToTry }, { headers, timeout });
-                // success — lock in whichever key/model combo worked
+                const isGptOss = isGptOssModel(modelToTry);
+                let url = GROQ_API_URL;
+                let requestPayload = { ...payload, model: modelToTry };
+
+                if (isGptOss) {
+                    url = GROQ_RESPONSES_API_URL;
+                    requestPayload = {
+                        model: modelToTry,
+                        input: payload.messages[payload.messages.length - 1].content,
+                        temperature: payload.temperature || 0.2,
+                        max_output_tokens: payload.max_tokens || 200,
+                        instructions: payload.messages[0].content
+                    };
+                }
+
+                const res = await axios.post(url, requestPayload, { headers, timeout });
+                
                 groqKeyIndex = (groqKeyIndex + k) % totalKeys;
                 groqApiKey = keyToTry;
-                groqModelIndex = (groqModelIndex + i) % GROQ_MODELS.length;
+                groqModelIndex = (groqModelIndex + i) % ALL_MODELS.length;
                 GROQ_MODEL = modelToTry;
                 return res;
             } catch (err) {
@@ -42,19 +76,18 @@ async function callGroqWithFallback(payload, timeout) {
                 const status = err.response?.status;
 
                 if (status === 401 || status === 403) {
-                    // key itself is bad — stop trying other models on this key, rotate to next key
                     authFailed = true;
                     console.log(clr('bYellow', `  ⚠ Groq key #${(groqKeyIndex + k) % totalKeys + 1} rejected (${status}) — rotating to next key...`));
                     break;
                 }
 
                 const retriable = status === 429 || status === 400 || status === 404 || status >= 500;
-                if (!retriable) throw err; // network error etc — don't burn through fallbacks
+                if (!retriable) throw err;
                 console.log(clr('bYellow', `  ⚠ Groq model "${modelToTry}" failed (${status || err.message}) — trying next model...`));
             }
         }
 
-        if (!authFailed) break; // model fallback exhausted for a non-auth reason, no point rotating keys further
+        if (!authFailed) break;
     }
     throw lastErr;
 }
@@ -67,7 +100,7 @@ let proxyFailCount = {};
 let activeProxies = [];
 let groqApiKeys = [];
 let groqKeyIndex = 0;
-let groqApiKey = null; // kept for compatibility — always mirrors groqApiKeys[groqKeyIndex]
+let groqApiKey = null;
 let useGroq = false;
 let predictionHistory = [];
 
@@ -351,7 +384,27 @@ Respond with JSON only.`;
             15000
         );
 
-        const text = response.data?.choices?.[0]?.message?.content?.trim();
+        let text = null;
+        
+        if (response.data?.choices?.[0]?.message?.content) {
+            text = response.data.choices[0].message.content.trim();
+        } else if (response.data?.output) {
+            for (const item of response.data.output) {
+                if (item.type === 'message' && item.content && item.content.length > 0) {
+                    for (const contentItem of item.content) {
+                        if (contentItem.type === 'output_text' && contentItem.text) {
+                            text = contentItem.text;
+                            break;
+                        }
+                    }
+                }
+                if (text) break;
+            }
+            if (!text && response.data.output_text) {
+                text = response.data.output_text;
+            }
+        }
+        
         if (!text) return null;
 
         const clean = text.replace(/```json|```/g, '').trim();
@@ -668,7 +721,7 @@ function getCategoryAccuracy(category) {
     try {
         const history = loadPredictionHistory();
         const catHistory = history.filter(p => p.category === category && typeof p.correct === 'boolean');
-        if (catHistory.length < 5) return null; // not enough data
+        if (catHistory.length < 5) return null;
         const recent = catHistory.slice(-30);
         return recent.filter(p => p.correct).length / recent.length;
     } catch (e) { return null; }
@@ -694,7 +747,7 @@ async function decideAnswer(idx, event, priceData) {
                 confidence: groqResult.confidence,
                 marketYes: odds1,
                 marketNo: odds0,
-                correct: null  // will be back-filled when event resolves
+                correct: null
             });
             savePredictionHistory(predictionHistory);
         } else {
@@ -706,7 +759,6 @@ async function decideAnswer(idx, event, priceData) {
         const marketPrediction = odds1 > odds0 ? 1 : 0;
         const marketStrength = Math.abs(odds1 - odds0);
         
-        // Adaptive AI weight: boost if category accuracy is high
         const catAccuracy = getCategoryAccuracy(groqResult.category);
         let aiWeight = 0.6;
         if (groqResult.confidence > 0.8) aiWeight = 0.75;
@@ -734,7 +786,6 @@ async function decideAnswer(idx, event, priceData) {
             timestamp: Date.now()
         });
         
-        // Return object with answer + confidence so bet sizing works correctly
         return { answer: finalAnswer, confidence: groqResult.confidence };
     }
     
@@ -742,7 +793,6 @@ async function decideAnswer(idx, event, priceData) {
         return { answer: groqResult.answer, confidence: groqResult.confidence };
     }
     
-    // Fallback: pure odds-based, no random noise
     if (priceData?.prices) {
         const favorite = odds1 > odds0 ? 1 : 0;
         return { answer: favorite, confidence: null };
@@ -880,7 +930,6 @@ async function checkResolvedBets(idx, currentEvents) {
                 history.push({ ...bet, resolvedAt: new Date().toISOString(), result: 'loss' });
             }
             
-            // Back-fill prediction history outcome so accuracy tracking works
             const ph = loadPredictionHistory();
             const matchIdx = ph.findLastIndex(p => 
                 p.eventTitle && bet.eventTitle && 
@@ -911,6 +960,9 @@ async function checkResolvedBets(idx, currentEvents) {
     saveActiveBets(idx, stillActive);
     saveBetHistory(idx, history);
 }
+
+// Global flag to track if we should wait for next day
+let globalWaitForNextDay = false;
 
 async function runAccount(idx) {
     if (!queries[idx]) { logWarn(idx, 'Invalid query, skipping.'); return; }
@@ -956,6 +1008,14 @@ async function runAccount(idx) {
     const MAX_CONSECUTIVE = 2;
 
     while (true) {
+        // Check if we need to wait for next day before continuing
+        if (globalWaitForNextDay) {
+            logInfo(idx, 'Waiting for next day (global wait triggered)...');
+            await sleepWithCountdown(getTimeUntilNextDay());
+            globalWaitForNextDay = false;
+            continue;
+        }
+
         if (!queries[idx]) { logWarn(idx, 'Query removed, stopping.'); break; }
         try {
             cycleCount++;
@@ -1005,7 +1065,6 @@ async function runAccount(idx) {
                 const priceData = await getEventPrices(idx, event.id);
                 const result = await decideAnswer(idx, event, priceData);
                 
-                // result is always { answer, confidence } - extract correctly
                 const answer = (result && typeof result === 'object') ? result.answer : result;
                 const confidence = (result && typeof result === 'object') ? result.confidence : null;
 
@@ -1025,6 +1084,8 @@ async function runAccount(idx) {
         } catch (error) {
             if (error.message && error.message.includes("Cannot read properties of null")) {
                 logOk(idx, 'Bet limit reached. Done for today.');
+                // Set global flag to make all accounts wait
+                globalWaitForNextDay = true;
                 break;
             }
             logErr(idx, `Cycle error: ${error.message}`);
@@ -1033,10 +1094,19 @@ async function runAccount(idx) {
     }
 }
 
+function getTimeUntilNextDay() {
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    return tomorrow.getTime() - now.getTime();
+}
+
 async function sleepWithCountdown(ms) {
+    if (ms <= 0) return;
     const endTime = Date.now() + ms;
     const intervalMs = 30 * 60 * 1000;
-    logSleep(`Sleeping ${formatDuration(ms)} until next run...`);
+    logSleep(`Sleeping ${formatDuration(ms)} until next day...`);
     while (Date.now() < endTime) {
         const remaining = endTime - Date.now();
         if (remaining <= 0) break;
@@ -1046,6 +1116,7 @@ async function sleepWithCountdown(ms) {
             logSleep(`Next run in ${formatDuration(stillLeft)}...`);
         }
     }
+    logWake('New day started! Resuming...');
 }
 
 async function showMenu() {
@@ -1062,13 +1133,14 @@ async function showMenu() {
     groqApiKey = groqApiKeys[0] || null;
     if (groqApiKeys.length > 0) {
         console.log(clr('bGreen', `  ✓ Loaded ${groqApiKeys.length} Groq API key(s) from grok.txt${groqApiKeys.length > 1 ? ' (auto-rotate on 401/403 enabled)' : ''}`));
+        console.log(clr('bGreen', `  ✓ Models: ${ALL_MODELS.join(' → ')}`));
         if (accuracyStats && accuracyStats.totalPredictions > 0) {
             console.log(clr('bCyan', `  📊 Historical AI accuracy: ${(accuracyStats.overall * 100).toFixed(1)}% (${accuracyStats.totalPredictions} predictions)`));
         }
         const groqChoice = await ask(clr('bYellow', '🤖 Use Groq AI for bet decisions? (y/n): '));
         useGroq = groqChoice.toLowerCase() === 'y';
         if (useGroq) {
-            console.log(clr('bGreen', `  ✓ Groq AI enabled · models: ${GROQ_MODELS.join(' → ')} (auto-fallback)`));
+            console.log(clr('bGreen', `  ✓ Groq AI enabled · models: ${ALL_MODELS.join(' → ')} (auto-fallback)`));
             console.log(clr('bGreen', `  ✓ Ensemble method (AI + market): ENABLED by default`));
             console.log(clr('bGreen', `  ✓ Confidence-based betting: ENABLED by default`));
         } else {
@@ -1133,7 +1205,7 @@ async function showMenu() {
 
     console.log(clr('bGreen', '\n  ✓ Configuration complete!'));
     console.log(clr('bGreen', `  ✓ Bet amount: ${config.betAmount} PTS`));
-    console.log(clr('bGreen', `  ✓ AI mode: ${useGroq ? 'Groq (' + GROQ_MODELS.join(' → ') + ')' : 'Odds strategy'}`));
+    console.log(clr('bGreen', `  ✓ AI mode: ${useGroq ? 'Groq (' + ALL_MODELS.join(' → ') + ')' : 'Odds strategy'}`));
     if (useGroq) {
         console.log(clr('bGreen', `  ✓ Ensemble method: ON (AI + market combination)`));
         console.log(clr('bGreen', `  ✓ Confidence-based betting: ON (adjusts bet size)`));
@@ -1171,6 +1243,10 @@ async function main() {
         sectionHeader(`🚀  RUN #${runCount}  ·  ${queries.length} account(s)`, 'bGreen');
         console.log('');
 
+        // Reset global flag
+        globalWaitForNextDay = false;
+
+        // Run accounts in parallel
         await Promise.all(
             queries.map((_, idx) =>
                 (async () => {
@@ -1184,12 +1260,18 @@ async function main() {
             )
         );
 
-        const sleepHours = 22 + Math.random() * 4;
-        const sleepMs = Math.floor(sleepHours * 60 * 60 * 1000);
-
-        await sleepWithCountdown(sleepMs);
+        // If any account hit the bet limit, wait until next day
+        if (globalWaitForNextDay) {
+            const timeUntil = getTimeUntilNextDay();
+            logSleep(`All accounts done. Waiting ${formatDuration(timeUntil)} until next day...`);
+            await sleepWithCountdown(timeUntil);
+        } else {
+            const sleepHours = 22 + Math.random() * 4;
+            const sleepMs = Math.floor(sleepHours * 60 * 60 * 1000);
+            await sleepWithCountdown(sleepMs);
+        }
+        
         logWake(`Waking up! Starting run #${runCount + 1}...`);
-
         accountStats = {};
     }
 }
